@@ -17,13 +17,30 @@ function run(args: string[]): Promise<string> {
     })
     let stdout = ""
     let stderr = ""
+    let failure: Error | undefined
+    const stop = (message: string) => {
+      failure ??= new Error(message)
+      child.kill()
+    }
+    const timer = setTimeout(() => stop(`opencode ${args[0]} timed out`), 30_000)
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
-    child.stdout.on("data", (chunk) => (stdout += chunk))
-    child.stderr.on("data", (chunk) => (stderr += chunk))
-    child.on("error", reject)
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk
+      if (stdout.length + stderr.length > 4_000_000) stop("CLI output limit exceeded")
+    })
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk
+      if (stdout.length + stderr.length > 4_000_000) stop("CLI output limit exceeded")
+    })
+    child.on("error", (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
     child.on("close", (code) => {
-      if (code === 0) resolve(stdout.trim())
+      clearTimeout(timer)
+      if (failure) reject(failure)
+      else if (code === 0) resolve(stdout.trim())
       else reject(new Error(`opencode ${args.join(" ")} failed (${code}): ${stderr || stdout}`))
     })
   })
@@ -109,11 +126,19 @@ try {
 } finally {
   const ids = [...created]
   const removed: string[] = []
+  const cleanupFailures: string[] = []
   await mapLimit(ids, 8, async (id) => {
-    await api("session.remove", { params: { sessionID: id } })
-    removed.push(id)
+    try {
+      await api("session.remove", { params: { sessionID: id } })
+      removed.push(id)
+    } catch {
+      cleanupFailures.push(id)
+    }
   })
-  console.log(JSON.stringify({ removedTestSessions: removed.length }))
+  console.log(
+    JSON.stringify({ removedTestSessions: removed.length, cleanupFailures: cleanupFailures.length }),
+  )
+  if (cleanupFailures.length > 0) process.exitCode = 1
 }
 
 console.log(await run(["service", "status"]))

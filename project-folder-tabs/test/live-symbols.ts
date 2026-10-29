@@ -28,13 +28,30 @@ function run(args: string[]): Promise<string> {
     })
     let stdout = ""
     let stderr = ""
+    let failure: Error | undefined
+    const stop = (message: string) => {
+      failure ??= new Error(message)
+      child.kill()
+    }
+    const timer = setTimeout(() => stop(`opencode ${args[0]} timed out`), 30_000)
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
-    child.stdout.on("data", (chunk) => (stdout += chunk))
-    child.stderr.on("data", (chunk) => (stderr += chunk))
-    child.on("error", reject)
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk
+      if (stdout.length + stderr.length > 4_000_000) stop("CLI output limit exceeded")
+    })
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk
+      if (stdout.length + stderr.length > 4_000_000) stop("CLI output limit exceeded")
+    })
+    child.on("error", (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
     child.on("close", (code) => {
-      if (code === 0) resolve(stdout.trim())
+      clearTimeout(timer)
+      if (failure) reject(failure)
+      else if (code === 0) resolve(stdout.trim())
       else reject(new Error(`OpenCode request failed (${code}): ${stderr || stdout}`))
     })
   })

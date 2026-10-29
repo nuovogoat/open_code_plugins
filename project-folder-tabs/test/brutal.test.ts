@@ -403,7 +403,7 @@ test("brutal/privacy: hostile metadata and failures cannot reach logs, streams o
   const output = consoleCalls.map(([message]) => message as string).join("\n")
   assert.ok(
     output.split("\n").every((line) =>
-      /^\[project-folder-tabs\] (?:could not list sessions|could not rename \d+ session\(s\)|stopped a repeated pagination cursor|could not rename new session|session event stream stopped|initial synchronization stopped)$/.test(line),
+      /^\[project-folder-tabs\] (?:could not list sessions|could not rename \d+ session\(s\)|stopped a repeated pagination cursor|could not rename new session|session event stream stopped|initial synchronization stopped|title hook unavailable|session event stream unavailable|synchronization API unavailable|plugin context unavailable|synchronization page limit reached|session event stream cleanup failed)$/.test(line),
     ),
     "a non-generic message was logged",
   )
@@ -528,7 +528,7 @@ test("brutal/privacy: runtime source has no hidden I/O or unapproved dependencie
   ])
   const manifest = JSON.parse(manifestText)
 
-  assert.deepEqual(manifest.dependencies, { "@opencode/plugin": "2.1.4" })
+  assert.deepEqual(manifest.dependencies, { "@opencode/plugin": "latest" })
   assert.doesNotMatch(core, /(?:^|\n)\s*import\s/)
   assert.doesNotMatch(
     core,

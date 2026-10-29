@@ -1,17 +1,19 @@
 {
   "name": "opencode-project-folder-tabs",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "description": "Display project folder names on OpenCode session tabs",
   "private": true,
   "type": "module",
   "exports": "./index.ts",
   "dependencies": {
-    "@opencode/plugin": "2.1.4"
+    "@opencode/plugin": "latest"
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
     "test:stress": "node --test test/stress.test.ts",
-    "test:brutal": "node --test test/brutal.test.ts",
+    "test:brutal": "node --test test/brutal.test.ts test/lifecycle.test.ts",
+    "test:memory": "node --expose-gc --test test/memory.test.ts",
+    "test:sdk": "node test/sdk-compat.ts",
     "test:live": "node test/live-integration.ts",
     "test:live:symbols": "node test/live-symbols.ts"
   }
