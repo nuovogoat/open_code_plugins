@@ -12,3 +12,6 @@
 - Отдельные module graph для расположений OpenCode не видели общий реестр одинаковых имён → `test/collision.test.ts` (`isolated OpenCode module graphs`) и `test/live-collisions.ts`.
 - Поздний rename со старой подписью мог перезаписать актуальный различитель после смены реестра → `test/collision.test.ts` (`late update`).
 - Повторные plugin instances подпапок одного canonical root ошибочно получали родительские и числовые суффиксы → `test/collision.test.ts` (`one canonical root`) и `test/live-symbols.ts`.
+- Долгоживущий реестр удерживал полные canonical paths → дескрипторы без исходных путей и проверки приватности в `test/collision.test.ts` (`retains no raw paths`).
+- Hot reload нового формата реестра падал на активных записях прежней версии → ленивая миграция и `test/collision.test.ts` (`hot reload migrates legacy registry entries`).
+- Неполная очистка всех расположений могла оставлять глобальное состояние → проверки пустого реестра в `test/collision.test.ts` и `test/memory.test.ts`.

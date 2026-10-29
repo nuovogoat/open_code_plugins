@@ -13,7 +13,7 @@ opencode plugin update
 Для фиксированной версии вместо ветки укажите релизный тег:
 
 ```sh
-opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4.0::path:project-folder-tabs'
+opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4.1::path:project-folder-tabs'
 ```
 
 История версий: [CHANGELOG.md](CHANGELOG.md).
@@ -31,6 +31,7 @@ opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4
 
 - Не читает файлы, переписку или секреты и не делает сетевых запросов.
 - Пишет в журнал только общие ошибки без ID, путей, курсоров и ответов API.
+- Не хранит полные или нормализованные пути в долгоживущем общем реестре; после cleanup всех расположений реестр пуст. Родительские имена сохраняются только как необходимые фрагменты будущих различителей.
 - Удаляет опасные управляющие Unicode-символы, сохраняет ZWJ/ZWNJ и ограничивает имя 80 кодовыми точками.
 - Использует официальный `@opencode/plugin` `latest`, без жёсткой привязки к версии OpenCode.
 
@@ -79,3 +80,17 @@ npm run test:sdk
 реальный OpenCode через `OPENCODE_CLI`; создаваемые ими временные сессии и
 каталоги удаляются. Collision-fixture создаётся вне репозитория, чтобы OpenCode
 зарегистрировал два независимых проекта с одинаковым конечным именем.
+
+Длительная проверка реального сервера:
+
+```sh
+npm run test:live:soak
+```
+
+По умолчанию soak длится 30 минут. Он циклически создаёт и удаляет сессии в двух
+одноимённых независимых проектах, проверяет минимальные различители и стабильное
+число активных plugin instances, а через `/api/info` измеряет private memory,
+working set и handles процесса сервера. Проверяется полная очистка тестовых сессий.
+Длительность и нагрузка настраиваются через `SOAK_DURATION_MS`,
+`SOAK_INTERVAL_MS`, `SOAK_SAMPLE_INTERVAL_MS` и
+`SOAK_MAX_PRIVATE_GROWTH_BYTES`.

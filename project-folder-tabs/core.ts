@@ -213,10 +213,22 @@ function parentSegments(directory: string): string[] {
 }
 
 function projectKey(directory: string): string {
-  const normalized = directory.replace(/[\\/]+/gu, "/").replace(/\/+$/u, "")
-  return /^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("//")
-    ? normalized.toLowerCase()
-    : normalized
+  let normalized = directory.replace(/[\\/]+/gu, "/").replace(/\/+$/u, "")
+  if (/^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("//")) {
+    normalized = normalized.toLowerCase()
+  }
+  if (!normalized) return ""
+
+  // The registry needs equality, not the raw path. Two independent 32-bit
+  // hashes plus length form a compact identity without retaining that path.
+  let first = 0x811c9dc5
+  let second = 0x9e3779b9
+  for (let index = 0; index < normalized.length; index++) {
+    const code = normalized.charCodeAt(index)
+    first = Math.imul(first ^ code, 0x01000193)
+    second = Math.imul(second ^ code, 0x85ebca6b)
+  }
+  return `${normalized.length.toString(36)}:${(first >>> 0).toString(36)}:${(second >>> 0).toString(36)}`
 }
 
 function appendTitleSuffix(base: string, suffix: string): string {
@@ -230,12 +242,26 @@ function appendTitleSuffix(base: string, suffix: string): string {
   return `${shortened}${suffixCharacters.join("")}`
 }
 
+interface ProjectTitleDescriptor {
+  base: string
+  key: string
+  parents: string[]
+}
+
+function describeProject(location: PluginLocation): ProjectTitleDescriptor {
+  const path = projectPath(location)
+  return {
+    base: projectFolderName(location),
+    key: projectKey(path),
+    parents: parentSegments(path),
+  }
+}
+
 /** Return short names, adding only the minimum unique parent-path fragment. */
-export function disambiguateTabTitles(locations: PluginLocation[]): string[] {
-  const bases = locations.map(projectFolderName)
-  const paths = locations.map(projectPath)
-  const keys = paths.map(projectKey)
-  const depths = locations.map(() => 0)
+function disambiguateProjectTitles(projects: ProjectTitleDescriptor[]): string[] {
+  const bases = projects.map((project) => project.base)
+  const keys = projects.map((project) => project.key)
+  const depths = projects.map(() => 0)
   const titles = [...bases]
 
   while (true) {
@@ -253,7 +279,7 @@ export function disambiguateTabTitles(locations: PluginLocation[]): string[] {
     let changed = false
     for (const group of duplicates) {
       for (const index of group) {
-        const segments = parentSegments(paths[index])
+        const segments = projects[index].parents
         if (depths[index] < segments.length) {
           depths[index]++
           const suffix = segments.slice(0, depths[index]).reverse().join("/")
@@ -285,6 +311,10 @@ export function disambiguateTabTitles(locations: PluginLocation[]): string[] {
     }
   }
   return titles
+}
+
+export function disambiguateTabTitles(locations: PluginLocation[]): string[] {
+  return disambiguateProjectTitles(locations.map(describeProject))
 }
 
 async function renameBatch(
@@ -619,7 +649,7 @@ function createUpdateCoordinator(
 }
 
 interface ActiveProject {
-  location: PluginLocation
+  project: ProjectTitleDescriptor
   title: string
   restart: () => void
 }
@@ -635,9 +665,27 @@ if (existingRegistry !== activeProjects) {
   Reflect.set(globalThis, activeProjectsKey, activeProjects)
 }
 
+interface CompatibleActiveProject {
+  project?: ProjectTitleDescriptor
+  location?: PluginLocation
+  title: string
+  restart: () => void
+}
+
 function refreshActiveProjectTitles(): void {
-  const entries = [...activeProjects.values()]
-  const titles = disambiguateTabTitles(entries.map((entry) => entry.location))
+  const entries = [...activeProjects.values()] as CompatibleActiveProject[]
+  const projects = entries.map((entry) => {
+    if (entry.project) return entry.project
+
+    // A hot reload can leave active entries created by the previous release.
+    // Migrate them in place so their existing title hooks and restart closures
+    // keep working, then drop the last registry reference to the raw location.
+    const project = describeProject(entry.location!)
+    entry.project = project
+    delete entry.location
+    return project
+  })
+  const titles = disambiguateProjectTitles(projects)
   entries.forEach((entry, index) => {
     if (entry.title === titles[index]) return
     entry.title = titles[index]
@@ -656,9 +704,10 @@ export async function setupProjectFolderTabs(
 
   const key = Symbol("project-folder-tabs")
   const lifecycle = new AbortController()
+  const project = describeProject(ctx.location)
   const entry: ActiveProject = {
-    location: ctx.location,
-    title: projectFolderName(ctx.location),
+    project,
+    title: project.base,
     restart: () => {},
   }
   let work: AbortController | undefined

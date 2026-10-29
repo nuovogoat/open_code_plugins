@@ -70,6 +70,11 @@ test("memory: 3,000 hung setup/cleanup cycles leave no subscriptions or unbounde
     gc!()
     const retained = process.memoryUsage().heapUsed - baseline
 
+    const registry = Reflect.get(
+      globalThis,
+      Symbol.for("opencode.project-folder-tabs.active-projects"),
+    ) as Map<symbol, unknown>
+    assert.equal(registry.size, 0)
     assert.equal(active, 0)
     assert.equal(closed, cycles + 200)
     assert.equal(updates, 0)

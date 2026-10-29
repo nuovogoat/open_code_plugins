@@ -1,6 +1,6 @@
 {
   "name": "opencode-project-folder-tabs",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Display project folder names on OpenCode session tabs",
   "private": true,
   "type": "module",
@@ -16,6 +16,7 @@
     "test:sdk": "node test/sdk-compat.ts",
     "test:live": "node test/live-integration.ts",
     "test:live:symbols": "node test/live-symbols.ts",
-    "test:live:collisions": "node test/live-collisions.ts"
+    "test:live:collisions": "node test/live-collisions.ts",
+    "test:live:soak": "node test/live-soak.ts"
   }
 }

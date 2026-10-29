@@ -228,6 +228,116 @@ test("collision: a late update cannot overwrite a newer disambiguated title", as
   }
 })
 
+test("collision: the registry retains no raw paths and is empty after every cleanup", async () => {
+  const isolated = await import(new URL("../core.ts?registry-privacy", import.meta.url).href)
+  const registry = Reflect.get(
+    globalThis,
+    Symbol.for("opencode.project-folder-tabs.active-projects"),
+  ) as Map<symbol, Record<string, unknown>>
+  const secretRoot = "C:\\private\\customer-name"
+  const cleanups: Array<() => void> = []
+
+  function context(id: string): PluginContext {
+    return {
+      location: location(`${secretRoot}\\${id}\\frontend`, id),
+      session: {
+        async hook() {},
+        async list() {
+          return { data: [] }
+        },
+        async update() {},
+      },
+      event: {
+        subscribe({ signal }) {
+          return (async function* () {
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve()
+              else signal.addEventListener("abort", () => resolve(), { once: true })
+            })
+          })()
+        },
+      },
+    }
+  }
+
+  try {
+    cleanups.push(await isolated.setupProjectFolderTabs(context("client-a")))
+    cleanups.push(await isolated.setupProjectFolderTabs(context("client-b")))
+    assert.equal(registry.size, 2)
+    for (const entry of registry.values()) {
+      assert.equal("location" in entry, false)
+      assert.deepEqual(Object.keys(entry.project as object).sort(), ["base", "key", "parents"])
+      const retained = JSON.stringify(entry)
+      assert.ok(!retained.includes(secretRoot))
+      assert.ok(!retained.includes("C:\\private"))
+    }
+  } finally {
+    for (const cleanup of cleanups.reverse()) cleanup()
+  }
+  assert.equal(registry.size, 0)
+})
+
+test("collision: hot reload migrates legacy registry entries without dropping active projects", async () => {
+  const isolated = await import(new URL("../core.ts?hot-reload-migration", import.meta.url).href)
+  const registry = Reflect.get(
+    globalThis,
+    Symbol.for("opencode.project-folder-tabs.active-projects"),
+  ) as Map<symbol, Record<string, any>>
+  const legacyKey = Symbol("legacy-project")
+  const legacyPath = "C:\\work\\client-a\\frontend"
+  let restarts = 0
+  const legacy = {
+    location: location(legacyPath, "legacy"),
+    title: "frontend",
+    restart() {
+      restarts++
+    },
+  }
+  let cleanup: (() => void) | undefined
+  registry.set(legacyKey, legacy)
+
+  try {
+    cleanup = await isolated.setupProjectFolderTabs({
+      location: location("D:\\work\\client-b\\frontend", "current"),
+      session: {
+        async hook() {},
+        async list() {
+          return { data: [] }
+        },
+        async update() {},
+      },
+      event: {
+        subscribe({ signal }) {
+          return (async function* () {
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve()
+              else signal.addEventListener("abort", () => resolve(), { once: true })
+            })
+          })()
+        },
+      },
+    })
+
+    assert.equal(registry.size, 2)
+    assert.equal("location" in legacy, false)
+    assert.deepEqual(Object.keys(legacy.project).sort(), ["base", "key", "parents"])
+    assert.ok(!JSON.stringify(legacy).includes(legacyPath))
+    assert.equal(legacy.title, "frontend — client-a")
+    assert.equal(restarts, 1)
+    const current = [...registry.values()].find((entry) => entry !== legacy)
+    assert.equal(current?.title, "frontend — client-b")
+
+    cleanup()
+    cleanup = undefined
+    assert.equal(legacy.title, "frontend")
+    assert.equal(restarts, 2)
+  } finally {
+    cleanup?.()
+    registry.delete(legacyKey)
+  }
+  assert.equal(registry.size, 0)
+})
+
 test("collision: isolated OpenCode module graphs share the live project registry", async () => {
   const first = await import(new URL("../core.ts?registry-first", import.meta.url).href)
   const second = await import(new URL("../core.ts?registry-second", import.meta.url).href)
