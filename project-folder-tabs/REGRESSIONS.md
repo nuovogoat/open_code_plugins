@@ -9,3 +9,6 @@
 - Готовая или поздно завершившаяся hook-регистрация могла пережить cleanup → `test/lifecycle.test.ts` (`ready and late hook registrations`).
 - Повторные setup/cleanup с never-resolving API могли накапливать подписки и память → `test/memory.test.ts`.
 - Изменение или удаление частей SDK после обновления OpenCode могло ронять setup → `test/drift.test.ts`; контракт реального SDK проверяется `test/sdk-compat.ts`.
+- Отдельные module graph для расположений OpenCode не видели общий реестр одинаковых имён → `test/collision.test.ts` (`isolated OpenCode module graphs`) и `test/live-collisions.ts`.
+- Поздний rename со старой подписью мог перезаписать актуальный различитель после смены реестра → `test/collision.test.ts` (`late update`).
+- Повторные plugin instances подпапок одного canonical root ошибочно получали родительские и числовые суффиксы → `test/collision.test.ts` (`one canonical root`) и `test/live-symbols.ts`.

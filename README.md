@@ -6,7 +6,7 @@
 
 | Плагин | Версия | Назначение |
 | --- | --- | --- |
-| [project-folder-tabs](project-folder-tabs/) | 1.3.0 | Показывает имена папок проектов на вкладках сессий |
+| [project-folder-tabs](project-folder-tabs/) | 1.4.0 | Показывает имена папок проектов на вкладках сессий |
 
 ## Установка и обновление
 
@@ -14,6 +14,12 @@
 
 ```sh
 opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:project-folder-tabs'
+```
+
+Фиксированная версия устанавливается по Git-тегу и не обновляется автоматически:
+
+```sh
+opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4.0::path:project-folder-tabs'
 ```
 
 Проверка и установка обновлений всех настроенных пакетных плагинов:
@@ -28,5 +34,9 @@ opencode plugin update
 ## Разработка
 
 Исходники и тесты включены в репозиторий; журналы, `node_modules` и результаты прогонов исключены. Для каждого изменения запускайте тесты плагина и увеличивайте его версию в `package.json`.
+
+Релизы используют SemVer. При выпуске обновите версию в `package.json`, таблицу
+выше, команды фиксированной установки и changelog плагина, затем создайте тег
+`project-folder-tabs/vX.Y.Z`. Автотест не позволяет этим ссылкам разойтись.
 
 Проверки выполняются автоматически в GitHub Actions для `push` и pull request.

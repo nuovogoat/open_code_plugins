@@ -1,3 +1,4 @@
+import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { mkdir, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
@@ -111,13 +112,15 @@ try {
 
   await mapLimit(created, 6, async ({ id, expected }) => {
     const deadline = Date.now() + 30_000
+    let actual: unknown
     while (Date.now() < deadline) {
       const output = await run(["api", "session.get", "--param", `sessionID=${id}`])
       const session = JSON.parse(output).data
-      if (session?.title === expected) return
+      actual = session?.title
+      if (actual === expected) return
       await new Promise((resolve) => setTimeout(resolve, 75))
     }
-    throw new Error("A real Unicode project session was not renamed safely")
+    assert.equal(actual, expected, "A real Unicode project session was not renamed safely")
   })
 
   await mapLimit(projects, 4, async ({ directory }) => {

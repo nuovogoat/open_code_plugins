@@ -66,6 +66,12 @@ const MAX_SYNC_PAGES = 1_000
 const STREAM_RETRY_DELAY_MS = 1_000
 export const MAX_TAB_TITLE_LENGTH = 80
 
+type TitleSource = string | (() => string)
+
+function resolveTitle(title: TitleSource): string {
+  return typeof title === "function" ? title() : title
+}
+
 type WaitResult<T> =
   | { status: "fulfilled"; value: T }
   | { status: "rejected" | "timeout" | "aborted" }
@@ -170,20 +176,115 @@ export function folderName(directory: string): string {
   return name
 }
 
-export function projectFolderName(location: PluginLocation): string {
-  const candidates = [
+function projectPathCandidates(location: PluginLocation): string[] {
+  return [
     location?.project?.canonical,
     location?.project?.directory,
     location?.directory,
-  ]
+  ].filter((candidate): candidate is string => typeof candidate === "string")
+}
 
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue
+export function projectFolderName(location: PluginLocation): string {
+  for (const candidate of projectPathCandidates(location)) {
     const name = sanitizeTabTitle(folderName(candidate))
     if (name) return name
   }
 
   return "Project"
+}
+
+function projectPath(location: PluginLocation): string {
+  const base = projectFolderName(location)
+  for (const candidate of projectPathCandidates(location)) {
+    if (sanitizeTabTitle(folderName(candidate)) === base) return candidate
+  }
+  return ""
+}
+
+function parentSegments(directory: string): string[] {
+  if (typeof directory !== "string") return []
+  const withoutTrailingSeparators = directory.replace(/[\\/]+$/u, "")
+  const segments = withoutTrailingSeparators.split(/[\\/]+/u)
+  segments.pop()
+  return segments
+    .map((segment) => sanitizeTabTitle(segment))
+    .filter((segment) => segment && !/^[A-Za-z]:$/u.test(segment))
+    .reverse()
+}
+
+function projectKey(directory: string): string {
+  const normalized = directory.replace(/[\\/]+/gu, "/").replace(/\/+$/u, "")
+  return /^[A-Za-z]:\//u.test(normalized) || normalized.startsWith("//")
+    ? normalized.toLowerCase()
+    : normalized
+}
+
+function appendTitleSuffix(base: string, suffix: string): string {
+  const suffixCharacters = Array.from(sanitizeTabTitle(`_${suffix}`).slice(1))
+  const baseCharacters = Array.from(base)
+  const available = Math.max(0, MAX_TAB_TITLE_LENGTH - suffixCharacters.length)
+  let shortened = baseCharacters.slice(0, available).join("")
+  if (baseCharacters.length > available && available > 0) {
+    shortened = `${baseCharacters.slice(0, available - 1).join("")}…`
+  }
+  return `${shortened}${suffixCharacters.join("")}`
+}
+
+/** Return short names, adding only the minimum unique parent-path fragment. */
+export function disambiguateTabTitles(locations: PluginLocation[]): string[] {
+  const bases = locations.map(projectFolderName)
+  const paths = locations.map(projectPath)
+  const keys = paths.map(projectKey)
+  const depths = locations.map(() => 0)
+  const titles = [...bases]
+
+  while (true) {
+    const groups = new Map<string, number[]>()
+    titles.forEach((title, index) => {
+      const group = groups.get(title) ?? []
+      group.push(index)
+      groups.set(title, group)
+    })
+    const duplicates = [...groups.values()].filter(
+      (group) => new Set(group.map((index) => keys[index])).size > 1,
+    )
+    if (duplicates.length === 0) return titles
+
+    let changed = false
+    for (const group of duplicates) {
+      for (const index of group) {
+        const segments = parentSegments(paths[index])
+        if (depths[index] < segments.length) {
+          depths[index]++
+          const suffix = segments.slice(0, depths[index]).reverse().join("/")
+          titles[index] = appendTitleSuffix(bases[index], ` — ${suffix}`)
+          changed = true
+        }
+      }
+    }
+    if (!changed) break
+  }
+
+  // Distinct roots that remain identical after sanitization need a bounded
+  // fallback. Multiple plugin instances for one canonical root are the same
+  // project, however, and must never acquire numeric suffixes.
+  const groups = new Map<string, number[]>()
+  titles.forEach((title, index) => {
+    const group = groups.get(title) ?? []
+    group.push(index)
+    groups.set(title, group)
+  })
+  for (const group of groups.values()) {
+    if (group.length < 2 || new Set(group.map((index) => keys[index])).size < 2) continue
+    const pathNumbers = new Map<string, number>()
+    for (const index of group) {
+      const key = keys[index]
+      const number = pathNumbers.get(key) ?? pathNumbers.size + 1
+      pathNumbers.set(key, number)
+      titles[index] = appendTitleSuffix(titles[index], ` (${number})`)
+    }
+  }
+  return titles
 }
 
 async function renameBatch(
@@ -212,7 +313,7 @@ async function renameBatch(
  */
 export async function syncExistingSessions(
   ctx: PluginContext,
-  title = projectFolderName(ctx.location),
+  title: TitleSource = projectFolderName(ctx.location),
   options: LifecycleOptions = {},
 ): Promise<SyncStats> {
   const stats: SyncStats = { pages: 0, renamed: 0, failed: 0 }
@@ -252,13 +353,14 @@ export async function syncExistingSessions(
     }
 
     const page = listed.value
+    const currentTitle = resolveTitle(title)
     stats.pages++
     const sessions = Array.isArray(page?.data) ? page.data : []
     const pending = sessions.filter(
       (session) =>
         session &&
         typeof session.id === "string" &&
-        session.title !== title &&
+        session.title !== currentTitle &&
         !seenSessions.has(session.id),
     )
     for (const session of pending) seenSessions.add(session.id)
@@ -266,7 +368,7 @@ export async function syncExistingSessions(
     for (let offset = 0; offset < pending.length; offset += UPDATE_CONCURRENCY) {
       if (options.signal?.aborted) break
       const batch = pending.slice(offset, offset + UPDATE_CONCURRENCY)
-      const failed = await renameBatch(batch, title, ctx, options)
+      const failed = await renameBatch(batch, currentTitle, ctx, options)
       stats.renamed += batch.length - failed
       stats.failed += failed
       if (failed > 0 && !options.signal?.aborted) {
@@ -312,7 +414,7 @@ export interface WatchResult {
 /** Resolve after the event stream ends or aborts; never reject into a void task. */
 export async function watchCreatedSessions(
   ctx: PluginContext,
-  title: string,
+  title: TitleSource,
   signal: AbortSignal,
   options: LifecycleOptions = {},
 ): Promise<WatchResult> {
@@ -347,12 +449,17 @@ export async function watchCreatedSessions(
         break
       }
 
-      const sessionID = createdSessionID(next.value.value, ctx.location.project.id, title)
+      const currentTitle = resolveTitle(title)
+      const sessionID = createdSessionID(
+        next.value.value,
+        ctx.location.project.id,
+        currentTitle,
+      )
       if (!sessionID) continue
       const update =
         options.update ??
         (async (id: string) => {
-          await ctx.session.update({ sessionID: id, title })
+          await ctx.session.update({ sessionID: id, title: currentTitle })
         })
       const updated = await waitFor(() => update(sessionID), effectiveOptions)
       if (updated.status === "aborted") break
@@ -378,7 +485,7 @@ export async function watchCreatedSessions(
 /** Reconnect after stream failures and reconcile events missed while offline. */
 async function superviseCreatedSessions(
   ctx: PluginContext,
-  title: string,
+  title: TitleSource,
   options: LifecycleOptions,
 ): Promise<void> {
   const signal = options.signal
@@ -443,7 +550,7 @@ function disposeRegistration(registration: unknown): void {
 
 async function initializeTitleHook(
   ctx: PluginContext,
-  title: string,
+  title: TitleSource,
   options: LifecycleOptions,
   setRegistration: (registration: unknown) => void,
 ): Promise<void> {
@@ -451,7 +558,7 @@ async function initializeTitleHook(
   const registration = Promise.resolve().then(() =>
     ctx.session.hook("title", (event) => {
       try {
-        if (event && typeof event === "object") event.result = title
+        if (event && typeof event === "object") event.result = resolveTitle(title)
       } catch (error) {
         // The runtime rejected the override; the watcher and sync still work.
       }
@@ -468,30 +575,74 @@ async function initializeTitleHook(
   void registration.then(disposeRegistration, () => {})
 }
 
-/** Share concurrent renames of one session between the watcher and initial sync. */
+interface InFlightUpdate {
+  title: string
+  task: Promise<void>
+}
+
+/** Serialize renames across watcher restarts and never finish on a stale title. */
 function createUpdateCoordinator(
   ctx: PluginContext,
-  title: string,
+  title: TitleSource,
   options: LifecycleOptions,
 ): (sessionID: string) => Promise<void> {
-  const inFlight = new Map<string, Promise<void>>()
+  const inFlight = new Map<string, InFlightUpdate>()
   return async (sessionID: string) => {
-    const existing = inFlight.get(sessionID)
-    if (existing) return existing
-    const task = (async () => {
-      const result = await waitFor(
-        () => ctx.session.update({ sessionID, title }),
-        options,
-      )
-      if (result.status !== "fulfilled") throw new Error("update failed")
-    })()
-    inFlight.set(sessionID, task)
-    try {
-      await task
-    } finally {
-      if (inFlight.get(sessionID) === task) inFlight.delete(sessionID)
+    while (!options.signal?.aborted) {
+      const existing = inFlight.get(sessionID)
+      if (existing) {
+        await existing.task
+        if (options.signal?.aborted || resolveTitle(title) === existing.title) return
+        continue
+      }
+
+      const operation: InFlightUpdate = {
+        title: resolveTitle(title),
+        task: Promise.resolve(),
+      }
+      operation.task = (async () => {
+        const result = await waitFor(
+          () => ctx.session.update({ sessionID, title: operation.title }),
+          options,
+        )
+        if (result.status !== "fulfilled") throw new Error("update failed")
+      })()
+      inFlight.set(sessionID, operation)
+      try {
+        await operation.task
+      } finally {
+        if (inFlight.get(sessionID) === operation) inFlight.delete(sessionID)
+      }
+      if (options.signal?.aborted || resolveTitle(title) === operation.title) return
     }
   }
+}
+
+interface ActiveProject {
+  location: PluginLocation
+  title: string
+  restart: () => void
+}
+
+// OpenCode may evaluate the same plugin entrypoint once per location. Keep the
+// registry on the shared realm global so those isolated module graphs still see
+// one another; Symbol.for avoids collisions with unrelated application state.
+const activeProjectsKey = Symbol.for("opencode.project-folder-tabs.active-projects")
+const existingRegistry = Reflect.get(globalThis, activeProjectsKey)
+const activeProjects: Map<symbol, ActiveProject> =
+  existingRegistry instanceof Map ? existingRegistry : new Map<symbol, ActiveProject>()
+if (existingRegistry !== activeProjects) {
+  Reflect.set(globalThis, activeProjectsKey, activeProjects)
+}
+
+function refreshActiveProjectTitles(): void {
+  const entries = [...activeProjects.values()]
+  const titles = disambiguateTabTitles(entries.map((entry) => entry.location))
+  entries.forEach((entry, index) => {
+    if (entry.title === titles[index]) return
+    entry.title = titles[index]
+    entry.restart()
+  })
 }
 
 export async function setupProjectFolderTabs(
@@ -502,26 +653,61 @@ export async function setupProjectFolderTabs(
     reportError("plugin context unavailable")
     return () => {}
   }
-  const title = projectFolderName(ctx.location)
-  const controller = new AbortController()
-  const effectiveOptions: LifecycleOptions = { ...options, signal: controller.signal }
-  effectiveOptions.update = createUpdateCoordinator(ctx, title, effectiveOptions)
+
+  const key = Symbol("project-folder-tabs")
+  const lifecycle = new AbortController()
+  const entry: ActiveProject = {
+    location: ctx.location,
+    title: projectFolderName(ctx.location),
+    restart: () => {},
+  }
+  let work: AbortController | undefined
+  let running = false
+  let stopped = false
   let hookRegistration: unknown
 
+  const title = () => entry.title
+  const hookOptions: LifecycleOptions = { ...options, signal: lifecycle.signal }
+  const updateSession = createUpdateCoordinator(ctx, title, hookOptions)
   const setRegistration = (registration: unknown) => {
-    if (controller.signal.aborted) disposeRegistration(registration)
+    if (lifecycle.signal.aborted) disposeRegistration(registration)
     else hookRegistration = registration
   }
+  // The hook registration survives retitling; its callback reads the current
+  // display title instead of capturing the initial folder name.
+  void initializeTitleHook(ctx, title, hookOptions, setRegistration)
 
-  // Do not hold plugin setup hostage to a stalled SDK call or a large session
-  // history. Cleanup is available immediately and aborts every background path.
-  void initializeTitleHook(ctx, title, effectiveOptions, setRegistration)
-  void superviseCreatedSessions(ctx, title, effectiveOptions)
+  entry.restart = () => {
+    if (stopped) return
+    work?.abort()
+    work = new AbortController()
+    const abortWork = () => work?.abort()
+    if (lifecycle.signal.aborted) work.abort()
+    else lifecycle.signal.addEventListener("abort", abortWork, { once: true })
+
+    const effectiveOptions: LifecycleOptions = { ...options, signal: work.signal }
+    effectiveOptions.update = updateSession
+    running = true
+    void superviseCreatedSessions(ctx, title, effectiveOptions).finally(() => {
+      lifecycle.signal.removeEventListener("abort", abortWork)
+    })
+  }
+
+  activeProjects.set(key, entry)
+  refreshActiveProjectTitles()
+  if (!running) entry.restart()
 
   return () => {
-    controller.abort()
+    if (stopped) return
+    stopped = true
+    activeProjects.delete(key)
+    lifecycle.abort()
+    work?.abort()
     const registration = hookRegistration
     hookRegistration = undefined
     if (registration !== undefined) disposeRegistration(registration)
+    // Removing one of several same-named projects restores the short title on
+    // the survivors and reconciles their existing sessions.
+    refreshActiveProjectTitles()
   }
 }
