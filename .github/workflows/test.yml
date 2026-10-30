@@ -18,3 +18,6 @@ jobs:
       - name: Test project-folder-tabs
         working-directory: project-folder-tabs
         run: npm test
+      - name: Test opecode-model-autorouter
+        working-directory: opecode-model-autorouter
+        run: npm test

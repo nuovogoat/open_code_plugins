@@ -7,6 +7,7 @@
 | Плагин | Версия | Назначение |
 | --- | --- | --- |
 | [project-folder-tabs](project-folder-tabs/) | 1.4.1 | Показывает имена папок проектов на вкладках сессий |
+| [opecode-model-autorouter](opecode-model-autorouter/) | 0.1.0 | Выбирает эквивалентные модели по скорости, стоимости и доступности |
 
 ## Установка и обновление
 
@@ -14,12 +15,14 @@
 
 ```sh
 opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:project-folder-tabs'
+opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:opecode-model-autorouter'
 ```
 
 Фиксированная версия устанавливается по Git-тегу и не обновляется автоматически:
 
 ```sh
 opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4.1::path:project-folder-tabs'
+opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter/v0.1.0::path:opecode-model-autorouter'
 ```
 
 Проверка и установка обновлений всех настроенных пакетных плагинов:
@@ -37,6 +40,7 @@ opencode plugin update
 
 Релизы используют SemVer. При выпуске обновите версию в `package.json`, таблицу
 выше, команды фиксированной установки и changelog плагина, затем создайте тег
-`project-folder-tabs/vX.Y.Z`. Автотест не позволяет этим ссылкам разойтись.
+`project-folder-tabs/vX.Y.Z` или `opecode-model-autorouter/vX.Y.Z`. Автотесты не позволяют
+этим ссылкам разойтись.
 
 Проверки выполняются автоматически в GitHub Actions для `push` и pull request.

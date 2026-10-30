@@ -1,0 +1,20 @@
+{
+  "name": "opecode-model-autorouter",
+  "version": "0.1.0",
+  "description": "Route equivalent OpenCode models by live speed, cost and provider availability",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./rpc": "./rpc.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "test:memory": "node --expose-gc --test test/memory.test.ts",
+    "test:sdk": "node test/sdk-compat.ts",
+    "test:live": "node test/live-router.ts"
+  }
+}
