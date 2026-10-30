@@ -1,3 +1,11 @@
+import {
+  loadAccountSnapshots,
+  withAccountPricing,
+  type AccountProvider,
+  type AccountSnapshot,
+  type ModelCost,
+} from "./pricing.ts"
+
 export type Strategy = "free-fastest" | "fastest" | "cheapest" | "manual"
 
 export interface ModelRef {
@@ -15,15 +23,14 @@ export interface ModelInfo extends ModelRef {
     input?: string[]
     output?: string[]
   }
+  variants?: Array<{ id: string }>
   limit?: {
     context?: number
     output?: number
   }
-  cost?: Array<{
-    input: number
-    output: number
-    cache?: { read: number; write: number }
-  }>
+  cost?: ModelCost[]
+  costCurrency?: string
+  priceState?: "live" | "stale"
 }
 
 interface GroupOptions {
@@ -37,6 +44,7 @@ export interface RouterOptions {
   strategy?: Strategy
   defaultGroup?: string
   groups?: Record<string, GroupOptions>
+  disabledModels?: string[]
   cooldownMs?: number
   resumeAfterFailover?: boolean
   metricAlpha?: number
@@ -46,6 +54,8 @@ export interface RouterOptions {
 export interface Candidate extends ModelRef {
   info: ModelInfo
   order: number
+  /** Keep disabled models for current-model lookup, but never select them. */
+  disabled?: boolean
 }
 
 export interface RouteGroup {
@@ -79,6 +89,19 @@ export interface PluginContext {
   model: {
     list(input?: { types?: string[] }): Promise<{ data: ModelInfo[] }>
   }
+  /** Test/embedder override; production uses authenticated server-side account APIs. */
+  pricing?: {
+    load(signal: AbortSignal): Promise<AccountSnapshot[]>
+  }
+  provider?: {
+    list(): Promise<{ data: AccountProvider[] }>
+  }
+  integration?: {
+    connection: {
+      active(integrationID: string): Promise<unknown>
+      resolve(connection: unknown): Promise<unknown>
+    }
+  }
   session: {
     get(input: { sessionID: string }): Promise<{ model?: ModelRef }>
     switchModel(input: { sessionID: string; model: ModelRef }): Promise<void>
@@ -97,14 +120,23 @@ export interface PluginContext {
   rpc?: {
     register(definition: unknown, handlers: Record<string, (input: any) => Promise<unknown>>): Promise<Registration>
   }
+  storage?: {
+    get(key: string): Promise<unknown>
+    set(key: string, value: unknown): Promise<void>
+    remove(key: string): Promise<void>
+  }
 }
 
 const STRATEGIES = new Set<Strategy>(["free-fastest", "fastest", "cheapest", "manual"])
+const STORAGE_KEY = "router-options-v1"
 const CONTINUE_TEXT =
   "The previous model provider became unavailable. Continue the existing task using the conversation and tool results already present. Do not repeat completed side effects."
 const EVENT_TYPES = [
   "provider.updated",
   "model.updated",
+  "credential.updated",
+  "credential.switched",
+  "integration.updated",
   "config.updated",
   "session.step.started",
   "session.step.ended",
@@ -135,14 +167,20 @@ function sameRouteModel(a: ModelRef, b: ModelRef, automatic: boolean): boolean {
 function parseRef(value: string | ModelRef): ModelRef | undefined {
   if (typeof value !== "string") {
     return typeof value?.providerID === "string" && typeof value?.id === "string"
-      ? { providerID: value.providerID, id: value.id, variant: value.variant }
+      ? {
+          providerID: value.providerID,
+          id: value.id,
+          ...(typeof value.variant === "string" && value.variant
+            ? { variant: value.variant }
+            : {}),
+        }
       : undefined
   }
   const separator = value.indexOf("/")
   if (separator <= 0 || separator === value.length - 1) return undefined
   const providerID = value.slice(0, separator)
   const [id, variant] = value.slice(separator + 1).split("#", 2)
-  return id ? { providerID, id, variant: variant || undefined } : undefined
+  return id ? { providerID, id, ...(variant ? { variant } : {}) } : undefined
 }
 
 function positiveNumber(value: unknown, fallback: number): number {
@@ -153,6 +191,59 @@ function strategy(value: unknown, fallback: Strategy): Strategy {
   return typeof value === "string" && STRATEGIES.has(value as Strategy)
     ? (value as Strategy)
     : fallback
+}
+
+export function normalizeRouterOptions(value: unknown): RouterOptions {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  const input = value as Record<string, unknown>
+  const result: RouterOptions = {}
+  for (const key of ["enabled", "autoDiscover", "resumeAfterFailover"] as const) {
+    if (typeof input[key] === "boolean") result[key] = input[key]
+  }
+  if (STRATEGIES.has(input.strategy as Strategy)) result.strategy = input.strategy as Strategy
+  if (typeof input.defaultGroup === "string" && input.defaultGroup.trim()) {
+    result.defaultGroup = input.defaultGroup.trim().slice(0, 80)
+  }
+  for (const key of ["cooldownMs", "metricAlpha", "rescanIntervalMs"] as const) {
+    if (typeof input[key] === "number" && Number.isFinite(input[key]) && input[key] > 0) {
+      result[key] = input[key]
+    }
+  }
+  if (Array.isArray(input.disabledModels)) {
+    result.disabledModels = [
+      ...new Set(
+        input.disabledModels.flatMap((value) => {
+          const ref = typeof value === "string" ? parseRef(value) : undefined
+          return ref ? [`${ref.providerID}/${ref.id}`] : []
+        }),
+      ),
+    ].slice(0, 10_000)
+  }
+  if (input.groups && typeof input.groups === "object" && !Array.isArray(input.groups)) {
+    const groups: Record<string, GroupOptions> = {}
+    for (const [rawName, value] of Object.entries(input.groups).slice(0, 100)) {
+      const name = rawName.trim().slice(0, 80)
+      if (!name || !value || typeof value !== "object" || Array.isArray(value)) continue
+      const group = value as GroupOptions
+      if (!Array.isArray(group.models)) continue
+      const models = group.models.flatMap((model) => {
+        const ref = parseRef(model)
+        return ref ? [ref] : []
+      })
+      groups[name] = {
+        models: models.slice(0, 1_000),
+        ...(STRATEGIES.has(group.strategy as Strategy)
+          ? { strategy: group.strategy as Strategy }
+          : {}),
+      }
+    }
+    result.groups = groups
+  }
+  return result
+}
+
+function defined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T
 }
 
 function metric(): ModelMetrics {
@@ -177,15 +268,32 @@ function isFree(model: ModelInfo): boolean {
   )
 }
 
-function catalogCost(model: ModelInfo): number {
+interface ComparableCost {
+  currency: string
+  value: number
+}
+
+function catalogCost(model: ModelInfo): ComparableCost | undefined {
   const tier = model.cost?.[0]
-  return tier ? tier.input + tier.output : Number.POSITIVE_INFINITY
+  return tier
+    ? { currency: model.costCurrency ?? "USD", value: tier.input + tier.output }
+    : undefined
 }
 
 function actualCostPerMillion(metrics: ModelMetrics): number | undefined {
   return metrics.generatedTokens > 0
     ? (metrics.totalCostUSD / metrics.generatedTokens) * 1_000_000
     : undefined
+}
+
+function candidateCost(candidate: Candidate, metrics: ReadonlyMap<string, ModelMetrics>): ComparableCost | undefined {
+  const catalog = catalogCost(candidate.info)
+  const actual = actualCostPerMillion(metrics.get(modelKey(candidate)) ?? metric())
+  // OpenCode reports measured cost in USD. Never reinterpret it as a non-USD account tariff.
+  if (actual !== undefined && (!catalog || catalog.currency === "USD")) {
+    return { currency: "USD", value: actual }
+  }
+  return catalog
 }
 
 export function isLimitError(error: any): boolean {
@@ -212,11 +320,13 @@ export function buildRouteGroups(
 ): Map<string, RouteGroup> {
   const result = new Map<string, RouteGroup>()
   const defaultStrategy = strategy(options.strategy, "free-fastest")
-  const available = models.filter((model) => model.enabled !== false)
+  const disabled = new Set(options.disabledModels ?? [])
+  const enabled = models.filter((model) => model.enabled !== false)
+  const locallyDisabled = (model: ModelRef) => disabled.has(`${model.providerID}/${model.id}`)
 
   if (options.autoDiscover !== false) {
     const buckets = new Map<string, ModelInfo[]>()
-    for (const model of available) {
+    for (const model of enabled) {
       if (model.type && model.type !== "chat") continue
       const bucket = buckets.get(model.id) ?? []
       bucket.push(model)
@@ -234,6 +344,7 @@ export function buildRouteGroups(
           variant: info.variant,
           info,
           order,
+          disabled: locallyDisabled(info),
         })),
       })
     }
@@ -244,11 +355,11 @@ export function buildRouteGroups(
     for (const input of group?.models ?? []) {
       const ref = parseRef(input)
       if (!ref) continue
-      const info = available.find(
+      const info = enabled.find(
         (model) => model.providerID === ref.providerID && model.id === ref.id,
       )
       if (!info) continue
-      candidates.push({ ...ref, info, order: candidates.length })
+      candidates.push({ ...ref, info, order: candidates.length, disabled: locallyDisabled(ref) })
     }
     if (candidates.length > 0) {
       result.set(name, {
@@ -276,6 +387,7 @@ export function selectCandidate(
     : undefined
   let candidates = group.candidates.filter((candidate) => {
     const key = modelKey(candidate)
+    if (candidate.disabled || candidate.info.enabled === false) return false
     if (!includeCurrent && current && sameRouteModel(candidate, current, group.automatic)) return false
     if (attempted.has(key) || (cooldowns.get(key) ?? 0) > now) return false
     if (currentInfo?.capabilities?.tools && !candidate.info.capabilities?.tools) return false
@@ -308,21 +420,36 @@ export function selectCandidate(
     return latency || a.order - b.order
   }
 
-  return [...candidates].sort((a, b) => {
-    if (group.strategy === "cheapest") {
-      const left = metrics.get(modelKey(a)) ?? metric()
-      const right = metrics.get(modelKey(b)) ?? metric()
-      const cost =
-        (actualCostPerMillion(left) ?? catalogCost(a.info)) -
-        (actualCostPerMillion(right) ?? catalogCost(b.info))
-      if (cost !== 0) return cost
+  if (group.strategy === "cheapest") {
+    const costs = new Map<Candidate, ComparableCost | undefined>(
+      candidates.map((candidate) => [candidate, candidateCost(candidate, metrics)]),
+    )
+    const currencies = new Set(
+      [...costs.values()].flatMap((cost) => cost ? [cost.currency] : []),
+    )
+    if (currencies.size === 1) {
+      return [...candidates].sort((a, b) => {
+        const cost = (costs.get(a)?.value ?? Number.POSITIVE_INFINITY) -
+          (costs.get(b)?.value ?? Number.POSITIVE_INFINITY)
+        return cost || compareSpeed(a, b)
+      })[0]
     }
-    return compareSpeed(a, b)
-  })[0]
+    if (currencies.size > 1) {
+      // No exchange-rate source is assumed: mixed currencies are never compared numerically.
+      return [...candidates].sort((a, b) => {
+        const known = Number(Boolean(costs.get(b))) - Number(Boolean(costs.get(a)))
+        return known || compareSpeed(a, b)
+      })[0]
+    }
+  }
+  return [...candidates].sort(compareSpeed)[0]
 }
 
 export class ModelAutoRouter {
   readonly options: RouterOptions
+  private readonly configuredOptions: RouterOptions
+  private readonly ready: Promise<void>
+  private configuring: Promise<void> = Promise.resolve()
   private readonly metrics = new Map<string, ModelMetrics>()
   private readonly cooldowns = new Map<string, number>()
   private readonly steps = new Map<string, { model: ModelRef; started: number }>()
@@ -335,7 +462,9 @@ export class ModelAutoRouter {
   private activityCounter = 0
   private readonly registrations: Registration[] = []
   private groups = new Map<string, RouteGroup>()
+  private catalogModels: ModelInfo[] = []
   private models: ModelInfo[] = []
+  private accounts: ReadonlyMap<string, AccountSnapshot> = new Map()
   private refreshing: Promise<void> | undefined
   private stopped = false
   private timer: ReturnType<typeof setInterval> | undefined
@@ -346,11 +475,64 @@ export class ModelAutoRouter {
   constructor(ctx: PluginContext, rpcDefinition?: unknown) {
     this.ctx = ctx
     this.rpcDefinition = rpcDefinition
-    this.options = ctx.options ?? {}
+    this.configuredOptions = normalizeRouterOptions(ctx.options)
+    this.options = normalizeRouterOptions(this.configuredOptions)
+    this.ready = this.loadOptions()
   }
 
   private report(message: string): void {
     console.error(`[opecode-model-autorouter] ${message}`)
+  }
+
+  private replaceOptions(options: RouterOptions): void {
+    for (const key of Object.keys(this.options)) delete this.options[key as keyof RouterOptions]
+    Object.assign(this.options, normalizeRouterOptions(options))
+  }
+
+  private async loadOptions(): Promise<void> {
+    if (!this.ctx.storage) return
+    try {
+      const stored = await this.ctx.storage.get(STORAGE_KEY)
+      if (!this.stopped && stored !== undefined) {
+        this.replaceOptions(normalizeRouterOptions(stored))
+        this.scheduleRescan()
+      }
+    } catch {
+      if (!this.stopped) this.report("settings load failed")
+    }
+  }
+
+  async configure(patch: Record<string, unknown>, reset = false) {
+    const operation = this.configuring.then(async () => {
+      await this.ready
+      if (this.stopped) throw new Error("router is unavailable")
+      const next = reset
+        ? normalizeRouterOptions(this.configuredOptions)
+        : normalizeRouterOptions({ ...this.options, ...patch })
+      if (!reset && (patch.defaultGroup === null || patch.defaultGroup === "")) {
+        delete next.defaultGroup
+      }
+      try {
+        if (reset) await this.ctx.storage?.remove(STORAGE_KEY)
+        else await this.ctx.storage?.set(STORAGE_KEY, next)
+      } catch {
+        if (!this.stopped) this.report("settings save failed")
+        throw new Error("settings could not be saved")
+      }
+      if (this.stopped) throw new Error("router is unavailable")
+      this.replaceOptions(next)
+      if (next.enabled === false || next.resumeAfterFailover === false) this.pending.clear()
+      this.models = withAccountPricing(this.catalogModels, this.accounts)
+      this.groups = buildRouteGroups(this.models, this.options)
+      this.scheduleRescan()
+      await this.refresh()
+      return this.status()
+    })
+    this.configuring = operation.then(
+      () => undefined,
+      () => undefined,
+    )
+    return operation
   }
 
   private alpha(): number {
@@ -384,20 +566,71 @@ export class ModelAutoRouter {
     )
   }
 
+  /** Resolves the account key server-side; the value is never logged, stored, or exposed via RPC/GUI. */
+  private async resolveAccountKey(integrationID: string): Promise<string | undefined> {
+    const integration = this.ctx.integration
+    if (!integration) return undefined
+    try {
+      const connection = await integration.connection.active(integrationID)
+      if (!connection) return undefined
+      const credential = (await integration.connection.resolve(connection)) as
+        | { type?: string; key?: string; access?: string }
+        | undefined
+      if (credential?.type === "key" && typeof credential.key === "string" && credential.key) {
+        return credential.key
+      }
+      if (credential?.type === "oauth" && typeof credential.access === "string" && credential.access) {
+        return credential.access
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private async updateAccounts(): Promise<void> {
+    try {
+      const snapshots = this.ctx.pricing
+        ? await this.ctx.pricing.load(this.lifecycle.signal)
+        : await loadAccountSnapshots(
+            globalThis.fetch,
+            this.lifecycle.signal,
+            (this.ctx.provider ? await this.ctx.provider.list() : { data: [] }).data,
+            (integrationID) => this.resolveAccountKey(integrationID),
+            this.accounts,
+          )
+      if (this.stopped) return
+      this.accounts = new Map(snapshots.map((snapshot) => [snapshot.providerID, snapshot]))
+    } catch {
+      if (this.stopped || this.lifecycle.signal.aborted) return
+      this.report("account refresh failed")
+      // Cached account data is kept but never presented as fresh.
+      this.accounts = new Map(
+        [...this.accounts].map(([providerID, snapshot]) => [
+          providerID,
+          snapshot.state === "live" ? { ...snapshot, state: "stale" as const } : snapshot,
+        ]),
+      )
+    }
+  }
+
   async refresh(): Promise<void> {
     if (this.refreshing) return this.refreshing
     this.refreshing = (async () => {
-      try {
-        const { data: models } = await this.ctx.model.list({ types: ["chat"] })
-        if (this.stopped) return
-        this.models = models
-        this.groups = buildRouteGroups(models, this.options)
-      } catch {
-        if (!this.stopped) this.report("model scan failed")
-      } finally {
-        this.refreshing = undefined
-      }
-    })()
+      await this.ready
+      const [listed] = await Promise.allSettled([
+        this.ctx.model.list({ types: ["chat"] }),
+        this.updateAccounts(),
+      ])
+      if (this.stopped) return
+      if (listed.status === "fulfilled") this.catalogModels = listed.value.data
+      else this.report("model scan failed")
+      this.models = withAccountPricing(this.catalogModels, this.accounts)
+      this.groups = buildRouteGroups(this.models, this.options)
+      this.refreshing = undefined
+    })().finally(() => {
+      this.refreshing = undefined
+    })
     return this.refreshing
   }
 
@@ -511,7 +744,13 @@ export class ModelAutoRouter {
         false,
       )
       if (!candidate || !(await this.switchModel(sessionID, candidate))) return false
-      if (this.stopped || this.activity.get(sessionID) !== token) return false
+      if (
+        this.stopped ||
+        this.options.enabled === false ||
+        this.activity.get(sessionID) !== token
+      ) {
+        return false
+      }
       if (this.options.resumeAfterFailover !== false) {
         this.pending.set(sessionID, {
           providerID: candidate.providerID,
@@ -571,24 +810,33 @@ export class ModelAutoRouter {
     this.cooldowns.delete(modelKey(started.model))
   }
 
+  private canContinue(): boolean {
+    return (
+      !this.stopped &&
+      this.options.enabled !== false &&
+      this.options.resumeAfterFailover !== false
+    )
+  }
+
   private async executionFailed(data: any): Promise<void> {
     const sessionID = data?.sessionID
     if (
       typeof sessionID !== "string" ||
       !isLimitError(data?.error) ||
-      this.stopped ||
-      this.options.resumeAfterFailover === false ||
+      !this.canContinue() ||
       this.failedExecutions.has(sessionID)
     ) {
       return
     }
     this.failedExecutions.add(sessionID)
-    const token = this.activity.get(sessionID)
+    const token = this.activity.get(sessionID) ?? this.touch(sessionID)
     try {
       let pending = this.pending.get(sessionID)
       if (!pending) {
         const session = await this.ctx.session.get({ sessionID })
-        if (this.stopped || this.activity.get(sessionID) !== token) return
+        if (!this.canContinue() || this.activity.get(sessionID) !== token) {
+          return
+        }
         pending = this.pending.get(sessionID)
         if (
           !pending &&
@@ -598,7 +846,13 @@ export class ModelAutoRouter {
           pending = this.pending.get(sessionID)
         }
       }
-      if (!pending || this.stopped) return
+      if (
+        !pending ||
+        !this.canContinue() ||
+        this.activity.get(sessionID) !== token
+      ) {
+        return
+      }
       this.pending.delete(sessionID)
       await this.ctx.session.synthetic({
         sessionID,
@@ -617,6 +871,9 @@ export class ModelAutoRouter {
     switch (event.type) {
       case "provider.updated":
       case "model.updated":
+      case "credential.updated":
+      case "credential.switched":
+      case "integration.updated":
       case "config.updated":
         await this.refresh()
         break
@@ -651,30 +908,108 @@ export class ModelAutoRouter {
 
   status() {
     const now = Date.now()
-    return {
+    const snapshot = (ref: ModelRef, info: ModelInfo) => {
+      const key = modelKey(ref)
+      const current = this.metrics.get(key) ?? metric()
+      const actualCost = actualCostPerMillion(current)
+      return {
+        model: key,
+        free: isFree(info),
+        available: (this.cooldowns.get(key) ?? 0) <= now,
+        cooldownMs: Math.max(0, (this.cooldowns.get(key) ?? 0) - now),
+        ...current,
+        ...(actualCost === undefined ? {} : { actualCostPerMillionUSD: actualCost }),
+      }
+    }
+    const disabled = new Set(this.options.disabledModels ?? [])
+    const memberships = new Map<string, string[]>()
+    for (const group of this.groups.values()) {
+      for (const candidate of group.candidates) {
+        const key = `${candidate.providerID}/${candidate.id}`
+        const names = memberships.get(key) ?? []
+        if (!names.includes(group.name)) names.push(group.name)
+        memberships.set(key, names)
+      }
+    }
+    return defined({
       enabled: this.options.enabled !== false,
       autoDiscover: this.options.autoDiscover !== false,
       strategy: strategy(this.options.strategy, "free-fastest"),
+      defaultGroup: this.options.defaultGroup,
+      resumeAfterFailover: this.options.resumeAfterFailover !== false,
+      cooldownMs: positiveNumber(this.options.cooldownMs, 60_000),
+      metricAlpha: this.alpha(),
+      rescanIntervalMs: positiveNumber(this.options.rescanIntervalMs, 60_000),
+      accounts: [...this.accounts.values()].map((snapshot) => {
+        const matched = this.models.filter(
+          (model) => model.providerID === snapshot.providerID && model.priceState !== undefined,
+        ).length
+        return defined({
+          providerID: snapshot.providerID,
+          state: snapshot.state,
+          updatedAt: snapshot.updatedAt === undefined
+            ? undefined
+            : new Date(snapshot.updatedAt).toISOString(),
+          pricingSupported: snapshot.pricingSupported,
+          balanceSupported: snapshot.balanceSupported,
+          matchedModels: matched,
+          balance: snapshot.balance?.amount,
+          balanceCurrency: snapshot.balance?.currency,
+        })
+      }),
+      disabledModels: [...disabled].sort(),
+      manualGroups: Object.entries(this.options.groups ?? {}).map(([name, group]) => ({
+        name,
+        strategy: strategy(group.strategy, strategy(this.options.strategy, "free-fastest")),
+        models: group.models.flatMap((model) => {
+          const ref = parseRef(model)
+          return ref ? [modelKey(ref)] : []
+        }),
+      })),
       modelsDiscovered: this.models.length,
+      models: this.models.map((info) => {
+        const ref = { providerID: info.providerID, id: info.id }
+        const key = modelKey(ref)
+        return defined({
+          ...snapshot(ref, info),
+          providerID: info.providerID,
+          id: info.id,
+          name: info.name,
+          enabled: info.enabled !== false,
+          routingEnabled: info.enabled !== false && !disabled.has(key),
+          variants: info.variants?.map((variant) => variant.id) ?? [],
+          costCurrency: info.costCurrency,
+          priceState: info.priceState,
+          cost: info.cost?.map((tier) =>
+            defined({
+              tier: tier.tier ? { type: "context" as const, size: tier.tier.size } : undefined,
+              input: tier.input,
+              output: tier.output,
+              cache: tier.cache
+                ? defined({ read: tier.cache.read, write: tier.cache.write })
+                : undefined,
+            }),
+          ),
+          limit: info.limit
+            ? defined({ context: info.limit.context, output: info.limit.output })
+            : undefined,
+          capabilities: info.capabilities
+            ? defined({
+                tools: info.capabilities.tools,
+                input: info.capabilities.input,
+                output: info.capabilities.output,
+              })
+            : undefined,
+          groups: memberships.get(key) ?? [],
+        })
+      }),
       groups: [...this.groups.values()].map((group) => ({
         name: group.name,
         automatic: group.automatic,
         strategy: group.strategy,
-        candidates: group.candidates.map((candidate) => {
-          const key = modelKey(candidate)
-          const current = this.metrics.get(key) ?? metric()
-          const actualCost = actualCostPerMillion(current)
-          return {
-            model: key,
-            free: isFree(candidate.info),
-            available: (this.cooldowns.get(key) ?? 0) <= now,
-            cooldownMs: Math.max(0, (this.cooldowns.get(key) ?? 0) - now),
-            ...current,
-            ...(actualCost === undefined ? {} : { actualCostPerMillionUSD: actualCost }),
-          }
-        }),
+        candidates: group.candidates.map((candidate) => snapshot(candidate, candidate.info)),
       })),
-    }
+    })
   }
 
   private register(registration: Promise<Registration>): void {
@@ -704,6 +1039,16 @@ export class ModelAutoRouter {
 
   private readonly lifecycle = new AbortController()
 
+  private scheduleRescan(): void {
+    if (this.stopped) return
+    if (this.timer) clearInterval(this.timer)
+    this.timer = setInterval(
+      () => void this.refresh(),
+      positiveNumber(this.options.rescanIntervalMs, 60_000),
+    )
+    this.timer.unref?.()
+  }
+
   start(): void {
     this.register(this.ctx.session.hook("prompt", (event) => this.routePrompt(event)))
     this.register(this.ctx.session.hook("model.request", (event) => this.noteRequest(event)))
@@ -717,11 +1062,32 @@ export class ModelAutoRouter {
             await this.refresh()
             return this.status()
           },
+          configure: async (input: Record<string, unknown> & { reset?: boolean }) => {
+            const { reset = false, ...patch } = input
+            return this.configure(patch, reset)
+          },
           select: async (input: { sessionID: string; model: string }) => {
+            await this.ready
             const ref = parseRef(input.model)
-            const candidate = ref
-              ? [...this.groups.values()].flatMap((group) => group.candidates).find((item) => sameModel(item, ref))
+            const grouped = ref
+              ? [...this.groups.values()]
+                  .flatMap((group) => group.candidates)
+                  .find((item) => !item.disabled && sameModel(item, ref))
               : undefined
+            const info = ref
+              ? this.models.find(
+                  (item) =>
+                    item.providerID === ref.providerID &&
+                    item.id === ref.id &&
+                    item.enabled !== false &&
+                    !this.options.disabledModels?.includes(`${item.providerID}/${item.id}`),
+                )
+              : undefined
+            const candidate: Candidate | undefined = grouped
+              ? grouped
+              : ref && info
+                ? { ...ref, info, order: 0 }
+                : undefined
             if (!candidate || !(await this.switchModel(input.sessionID, candidate))) {
               throw new Error("model is unavailable")
             }
@@ -732,8 +1098,7 @@ export class ModelAutoRouter {
     }
     void this.refresh()
     void this.watch()
-    this.timer = setInterval(() => void this.refresh(), positiveNumber(this.options.rescanIntervalMs, 60_000))
-    this.timer.unref?.()
+    this.scheduleRescan()
   }
 
   cleanup(): void {
@@ -741,6 +1106,7 @@ export class ModelAutoRouter {
     this.stopped = true
     this.lifecycle.abort()
     if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
     for (const registration of this.registrations.splice(0)) {
       void Promise.resolve(registration.dispose?.()).catch(() => {})
     }

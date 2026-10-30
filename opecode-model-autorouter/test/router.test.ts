@@ -13,6 +13,7 @@ import {
   type PluginContext,
   type RouterEvent,
 } from "../core.ts"
+import type { AccountSnapshot } from "../pricing.ts"
 
 function model(providerID: string, id = "same", cost = 0, context = 200_000): ModelInfo {
   return {
@@ -87,6 +88,16 @@ test("routing: automatic groups recognize the current model independently of its
   )
 })
 
+test("routing: a locally disabled current model remains available for lookup but not selection", () => {
+  const group = buildRouteGroups([model("a"), model("b")], {
+    disabledModels: ["a/same"],
+  }).get("auto:same")!
+  const current = { providerID: "a", id: "same" }
+  assert.equal(group.candidates.length, 2)
+  assert.equal(group.candidates[0].disabled, true)
+  assert.equal(selectCandidate(group, current, new Map(), new Map(), 0)!.providerID, "b")
+})
+
 test("routing: unknown pricing is not treated as free", () => {
   const unknown = model("unknown")
   delete unknown.cost
@@ -110,6 +121,22 @@ test("routing: cheapest prefers measured cost and manual preserves configured pr
   assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "b")
   group.strategy = "manual"
   assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "b")
+})
+
+test("routing: cheapest never numerically compares different currencies", () => {
+  const rub = model("rub", "same")
+  rub.cost = [{ input: 1, output: 1 }]
+  rub.costCurrency = "RUB"
+  const usd = model("usd", "same")
+  usd.cost = [{ input: 1000, output: 1000 }]
+  usd.costCurrency = "USD"
+  const group = buildRouteGroups([rub, usd], { strategy: "cheapest" }).get("auto:same")!
+  // Numerically RUB 2 < USD 2000, but mixed currencies fall back to measured speed instead.
+  const stats = new Map<string, ModelMetrics>([
+    ["usd/same", metrics({ outputTokensPerSecond: 100 })],
+    ["rub/same", metrics({ outputTokensPerSecond: 10 })],
+  ])
+  assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "usd")
 })
 
 test("routing: cooldown, tools and automatic context compatibility are enforced", () => {
@@ -153,6 +180,7 @@ interface FakeContext extends PluginContext {
   switches: Array<{ sessionID: string; model: ModelRef }>
   synthetics: any[]
   rpcHandlers: Record<string, (input: any) => Promise<unknown>>
+  storageValues: Map<string, unknown>
   current: ModelRef
   disposed(): number
 }
@@ -174,6 +202,7 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
   const switches: Array<{ sessionID: string; model: ModelRef }> = []
   const synthetics: any[] = []
   const rpcHandlers: Record<string, (input: any) => Promise<unknown>> = {}
+  const storageValues = new Map<string, unknown>()
   const current: ModelRef = { providerID: models[0].providerID, id: models[0].id }
   let wake: (() => void) | undefined
   let disposed = 0
@@ -189,11 +218,17 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
     switches,
     synthetics,
     rpcHandlers,
+    storageValues,
     current,
     disposed: () => disposed,
     model: {
       async list() {
         return { data: models }
+      },
+    },
+    pricing: {
+      async load() {
+        return []
       },
     },
     session: {
@@ -212,7 +247,7 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
       },
       async hook(name, callback) {
         hooks.set(name, callback)
-        return { dispose: () => disposed++ }
+        return { dispose: () => { disposed++ } }
       },
     },
     event: {
@@ -246,7 +281,18 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
     rpc: {
       async register(_definition, handlers) {
         Object.assign(rpcHandlers, handlers)
-        return { dispose: () => disposed++ }
+        return { dispose: () => { disposed++ } }
+      },
+    },
+    storage: {
+      async get(key) {
+        return storageValues.get(key)
+      },
+      async set(key, value) {
+        storageValues.set(key, structuredClone(value))
+      },
+      async remove(key) {
+        storageValues.delete(key)
       },
     },
   }
@@ -254,8 +300,143 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
   return ctx
 }
 
+function accountSnapshot(
+  providerID: string,
+  costs: Record<string, { input: number; output: number }>,
+  currency = "USD",
+): AccountSnapshot {
+  return {
+    providerID,
+    state: "live",
+    updatedAt: Date.now(),
+    costs: new Map(
+      Object.entries(costs).map(([id, cost]) => [id, { currency, cost: [cost] }]),
+    ),
+    balance: { amount: 10, currency },
+    pricingSupported: true,
+    balanceSupported: true,
+  }
+}
+
+test("accounts: live refresh updates catalog, cheapest routing and stale fallback status", async () => {
+  const ctx = fakeContext([model("a", "same", 8), model("b", "same", 9)], {
+    strategy: "cheapest",
+  })
+  let fail = false
+  let snapshots = [
+    accountSnapshot("a", { same: { input: 4, output: 6 } }),
+    accountSnapshot("b", { same: { input: 0.5, output: 1 } }),
+  ]
+  ctx.pricing = {
+    async load() {
+      if (fail) throw new Error("offline")
+      return snapshots
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    const live = (await ctx.rpcHandlers.rescan({})) as any
+    assert.deepEqual(
+      live.accounts.map((account: any) => [account.providerID, account.state, account.matchedModels]),
+      [["a", "live", 1], ["b", "live", 1]],
+    )
+    assert.equal(live.accounts[0].balance, 10)
+    assert.equal(live.accounts[0].balanceCurrency, "USD")
+    assert.ok(live.accounts[0].updatedAt)
+    assert.equal(live.models[0].priceState, "live")
+    assert.equal(live.models[0].costCurrency, "USD")
+    assert.equal(live.models[0].cost[0].input, 4)
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "b")
+
+    snapshots = [
+      accountSnapshot("a", { same: { input: 0.1, output: 0.2 } }),
+      accountSnapshot("b", { same: { input: 0.5, output: 1 } }),
+    ]
+    await ctx.rpcHandlers.rescan({})
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "a")
+
+    fail = true
+    const stale = (await ctx.rpcHandlers.rescan({})) as any
+    assert.deepEqual(stale.accounts.map((account: any) => account.state), ["stale", "stale"])
+    assert.equal(stale.models[0].cost[0].input, 0.1)
+    assert.equal(stale.models[0].priceState, "stale")
+  } finally {
+    cleanup()
+  }
+})
+
+test("accounts: an unsupported provider account leaves models without a fabricated price", async () => {
+  const ctx = fakeContext([model("apimaster", "same", 8)])
+  ctx.pricing = {
+    async load() {
+      return [{
+        providerID: "apimaster",
+        state: "unsupported",
+        costs: new Map(),
+        pricingSupported: false,
+        balanceSupported: false,
+      }]
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    const status = (await ctx.rpcHandlers.rescan({})) as any
+    assert.equal(status.accounts[0].state, "unsupported")
+    assert.equal(status.accounts[0].matchedModels, 0)
+    assert.equal(status.models[0].cost, undefined)
+    assert.equal(status.models[0].priceState, undefined)
+    assert.equal(status.models[0].free, false)
+  } finally {
+    cleanup()
+  }
+})
+
+test("configuration: disabling the current model routes the next prompt to an alternative", async () => {
+  const ctx = fakeContext([model("a"), model("b")])
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    const configured = (await ctx.rpcHandlers.configure({ disabledModels: ["a/same"] })) as any
+    assert.equal(configured.groups[0].candidates.length, 2)
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "b")
+  } finally {
+    cleanup()
+  }
+})
+
+test("configuration: new options rebuild cached groups even when the rescan fails", async () => {
+  const ctx = fakeContext([model("a"), model("b")])
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    ctx.model.list = async () => { throw new Error("scan offline") }
+    ctx.pricing!.load = async () => { throw new Error("pricing offline") }
+    const configured = (await ctx.rpcHandlers.configure({ autoDiscover: false })) as any
+    assert.deepEqual(configured.groups, [])
+  } finally {
+    cleanup()
+  }
+})
+
 test("live routing: prompt admission selects the fastest free model from real step metrics", async () => {
   const ctx = fakeContext([model("paid", "same", 4), model("slow"), model("fast")])
+  // Free/paid status comes from account snapshots, not native catalog costs.
+  ctx.pricing = {
+    async load() {
+      return [
+        accountSnapshot("paid", { same: { input: 4, output: 4 } }),
+        accountSnapshot("slow", { same: { input: 0, output: 0 } }),
+        accountSnapshot("fast", { same: { input: 0, output: 0 } }),
+      ]
+    },
+  }
   const cleanup = setupModelAutoRouter(ctx, {})
   try {
     await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.rescan !== undefined)
@@ -513,6 +694,61 @@ test("failover: disabled automatic resume still switches without changing native
   }
 })
 
+test("failover: disabling autorouting cancels an already pending continuation", async () => {
+  const ctx = fakeContext([model("a"), model("b")])
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.hooks.has("retry") && ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    await ctx.hooks.get("retry")!({
+      sessionID: "ses",
+      model: { providerID: "a", id: "same" },
+      error: { status: 429 },
+      decision: { retry: true },
+    })
+    await ctx.rpcHandlers.configure({ enabled: false })
+    ctx.emit({ type: "session.execution.failed", data: { sessionID: "ses", error: { status: 429 } } })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(ctx.synthetics.length, 0)
+  } finally {
+    cleanup()
+  }
+})
+
+test("failover: disabling autorouting during a switch prevents a late continuation", async () => {
+  const ctx = fakeContext([model("a"), model("b")])
+  const cleanup = setupModelAutoRouter(ctx, {})
+  const originalSwitch = ctx.session.switchModel.bind(ctx.session)
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let calls = 0
+  ctx.session.switchModel = async (input) => {
+    calls++
+    if (calls === 1) await gate
+    await originalSwitch(input)
+  }
+  try {
+    await eventually(() => ctx.hooks.has("retry") && ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    const retry = ctx.hooks.get("retry")!({
+      sessionID: "ses",
+      model: { providerID: "a", id: "same" },
+      error: { status: 429 },
+      decision: { retry: true },
+    })
+    await eventually(() => calls === 1)
+    await ctx.rpcHandlers.configure({ enabled: false })
+    release()
+    await retry
+    ctx.emit({ type: "session.execution.failed", data: { sessionID: "ses", error: { status: 429 } } })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(ctx.synthetics.length, 0)
+  } finally {
+    release()
+    cleanup()
+  }
+})
+
 test("failover: user activity during an in-flight switch invalidates stale continuation", async () => {
   const ctx = fakeContext([model("a"), model("b")])
   const cleanup = setupModelAutoRouter(ctx, {})
@@ -568,6 +804,145 @@ test("manual default group routes an unrelated current model and RPC select is e
     const result = await ctx.rpcHandlers.select({ sessionID: "ses", model: "b/two#max" })
     assert.deepEqual(result, { selected: "b/two#max" })
     assert.equal(modelKey(ctx.current), "b/two#max")
+  } finally {
+    cleanup()
+  }
+})
+
+test("configuration: stored settings load before discovery and model switches affect routing only", async () => {
+  const ctx = fakeContext([model("a"), model("b"), model("single", "solo", 3)], {
+    strategy: "fastest",
+  })
+  ctx.storageValues.set("router-options-v1", {
+    enabled: false,
+    disabledModels: ["b/same#ignored-variant", "b/same", "invalid"],
+  })
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    const loaded = (await ctx.rpcHandlers.rescan({})) as any
+    assert.equal(loaded.enabled, false)
+    assert.equal(loaded.strategy, "free-fastest")
+    assert.deepEqual(loaded.disabledModels, ["b/same"])
+    assert.equal(loaded.modelsDiscovered, 3)
+    assert.equal("defaultGroup" in loaded, false)
+    assert.equal(loaded.groups.length, 1)
+    assert.equal(loaded.groups[0].candidates.length, 2)
+    assert.equal(loaded.models.length, 3)
+    assert.equal(loaded.models.find((item: any) => item.model === "b/same").routingEnabled, false)
+    assert.equal(loaded.models.find((item: any) => item.model === "single/solo").routingEnabled, true)
+    assert.deepEqual(loaded.models.find((item: any) => item.model === "single/solo").groups, [])
+
+    const configured = (await ctx.rpcHandlers.configure({
+      enabled: true,
+      strategy: "cheapest",
+      disabledModels: [],
+      autoDiscover: false,
+      defaultGroup: "chosen",
+      groups: {
+        chosen: { models: ["a/same", "single/solo"], strategy: "manual" },
+      },
+    })) as any
+    assert.equal(configured.enabled, true)
+    assert.equal(configured.strategy, "cheapest")
+    assert.equal(configured.defaultGroup, "chosen")
+    assert.deepEqual(configured.groups.map((group: any) => group.name), ["chosen"])
+    assert.deepEqual(configured.models.find((item: any) => item.model === "single/solo").groups, ["chosen"])
+    assert.equal(
+      (ctx.storageValues.get("router-options-v1") as any).groups.chosen.strategy,
+      "manual",
+    )
+    assert.equal(
+      "variant" in (ctx.storageValues.get("router-options-v1") as any).groups.chosen.models[0],
+      false,
+    )
+
+    const selected = await ctx.rpcHandlers.select({ sessionID: "ses", model: "single/solo#high" })
+    assert.deepEqual(selected, { selected: "single/solo#high" })
+    assert.equal(modelKey(ctx.current), "single/solo#high")
+
+    const reset = (await ctx.rpcHandlers.configure({ reset: true })) as any
+    assert.equal(reset.strategy, "fastest")
+    assert.equal(reset.defaultGroup, undefined)
+    assert.equal(reset.autoDiscover, true)
+    assert.equal(ctx.storageValues.has("router-options-v1"), false)
+  } finally {
+    cleanup()
+  }
+})
+
+test("configuration: a stored rescan interval replaces the startup timer", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const ctx = fakeContext([model("a"), model("b")])
+  ctx.storageValues.set("router-options-v1", { rescanIntervalMs: 5_000 })
+  let loads = 0
+  ctx.pricing!.load = async () => {
+    loads++
+    return []
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => loads === 1)
+    t.mock.timers.tick(4_999)
+    assert.equal(loads, 1)
+    t.mock.timers.tick(1)
+    await eventually(() => loads === 2)
+  } finally {
+    cleanup()
+  }
+})
+
+test("cleanup: an in-flight configuration cannot resurrect the rescan timer", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] })
+  const ctx = fakeContext([model("a"), model("b")])
+  let loads = 0
+  ctx.pricing!.load = async () => {
+    loads++
+    return []
+  }
+  const originalSet = ctx.storage!.set.bind(ctx.storage)
+  let markWrite!: () => void
+  const writing = new Promise<void>((resolve) => { markWrite = resolve })
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  ctx.storage!.set = async (key, value) => {
+    markWrite()
+    await gate
+    await originalSet(key, value)
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    const configuration = ctx.rpcHandlers.configure({ rescanIntervalMs: 1_000 })
+    await writing
+    cleanup()
+    const rejection = assert.rejects(configuration, /router is unavailable/u)
+    release()
+    await rejection
+    const before = loads
+    t.mock.timers.tick(120_000)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(loads, before)
+  } finally {
+    release()
+    cleanup()
+  }
+})
+
+test("configuration: direct selection includes enabled singletons and rejects locally disabled models", async () => {
+  const ctx = fakeContext([model("a"), model("b"), model("single", "solo")])
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.rescan !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    const selected = await ctx.rpcHandlers.select({ sessionID: "ses", model: "single/solo" })
+    assert.deepEqual(selected, { selected: "single/solo" })
+    await ctx.rpcHandlers.configure({ disabledModels: ["single/solo"] })
+    await assert.rejects(
+      ctx.rpcHandlers.select({ sessionID: "ses", model: "single/solo" }),
+      /model is unavailable/u,
+    )
   } finally {
     cleanup()
   }

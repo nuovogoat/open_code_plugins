@@ -66,6 +66,7 @@ const cleanup = await plugin.setup({
     },
   },
 } as never)
+if (typeof cleanup !== "function") throw new Error("plugin setup returned no cleanup")
 
 try {
   const deadline = Date.now() + 1_000
@@ -75,6 +76,8 @@ try {
   assert.deepEqual([...hooks.keys()].sort(), ["http.response", "model.request", "prompt", "retry"])
   const status = await rpcHandlers.rescan({})
   assert.equal(status.modelsDiscovered, 2)
+  assert.equal(status.models.length, 2)
+  assert.equal("defaultGroup" in status, false)
   assert.equal(status.groups[0].name, "auto:same")
   assert.equal(status.groups[0].candidates.length, 2)
   assert.equal(JSON.stringify(status).includes("C:\\"), false)
