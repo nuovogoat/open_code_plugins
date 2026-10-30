@@ -17,6 +17,14 @@ export interface AccountBalance {
 
 export type AccountState = "live" | "stale" | "unsupported"
 
+/** Where the account credential came from: OpenCode connections or the plugin-owned vault. */
+export type AccountKeySource = "plugin" | "opencode"
+
+export interface AccountKey {
+  value: string
+  source: AccountKeySource
+}
+
 export interface AccountSnapshot {
   providerID: string
   state: AccountState
@@ -25,6 +33,7 @@ export interface AccountSnapshot {
   balance?: AccountBalance
   pricingSupported: boolean
   balanceSupported: boolean
+  keySource?: AccountKeySource
 }
 
 export interface AccountProvider {
@@ -340,35 +349,41 @@ export async function loadAccountSnapshots(
   fetcher: typeof fetch,
   signal: AbortSignal,
   providers: readonly AccountProvider[],
-  resolveKey: (integrationID: string) => Promise<string | undefined>,
+  resolveKey: (provider: AccountProvider) => Promise<AccountKey | undefined>,
   previous: ReadonlyMap<string, AccountSnapshot> = new Map(),
 ): Promise<AccountSnapshot[]> {
   const unique = [...new Map(providers.map((provider) => [provider.id, provider])).values()]
   const snapshots = await Promise.all(unique.map(async (provider): Promise<AccountSnapshot | undefined> => {
     const capability = capabilities(provider.id)
+    let key: AccountKey | undefined
     try {
-      const key = await resolveKey(provider.integrationID ?? provider.id)
+      key = await resolveKey(provider)
       if (!capability.supported) {
         // Providers without a confirmed account API only surface when actually connected.
-        return key ? emptySnapshot(provider.id, "unsupported", false, false) : undefined
+        return key ? { ...emptySnapshot(provider.id, "unsupported", false, false), keySource: key.source } : undefined
       }
       if (!key) throw new Error("account credentials are unavailable")
       if (signal.aborted) throw new Error("account refresh was aborted")
-      switch (provider.id) {
-        case "openrouter":
-          return await openRouter(fetcher, key, signal)
-        case "teamorouter":
-          return await teamoRouter(fetcher, key, signal)
-        case "plusvibe":
-          return await plusVibe(fetcher, key, signal)
-        default:
-          return emptySnapshot(provider.id, "unsupported", false, false)
-      }
+      const snapshot = await (() => {
+        switch (provider.id) {
+          case "openrouter":
+            return openRouter(fetcher, key!.value, signal)
+          case "teamorouter":
+            return teamoRouter(fetcher, key!.value, signal)
+          case "plusvibe":
+            return plusVibe(fetcher, key!.value, signal)
+          default:
+            return Promise.resolve(emptySnapshot(provider.id, "unsupported", false, false))
+        }
+      })()
+      return { ...snapshot, keySource: key.source }
     } catch (error) {
       if (signal.aborted) throw error
       const cached = previous.get(provider.id)
+      // A cached snapshot only keeps its key source while the credential still resolves;
+      // a cleared vault key or removed connection must not claim a source it no longer has.
       return cached
-        ? { ...cached, state: "stale" }
+        ? { ...cached, state: "stale", keySource: key?.source }
         : emptySnapshot(provider.id, "stale", capability.pricing, capability.balance)
     }
   }))

@@ -179,6 +179,9 @@ try {
       assert.ok(account?.matchedModels > 0, `${providerID} account prices matched no catalog models`)
       assert.equal(typeof account?.balance, "number", `${providerID} returned no account balance`)
       assert.ok(account?.updatedAt, `${providerID} snapshot has no timestamp`)
+      // No vault key is configured in the live run, so credentials come from OpenCode.
+      assert.equal(account?.keySource, "opencode", `${providerID} reported an unexpected key source`)
+      assert.equal(account?.pluginKey, undefined, `${providerID} claims a plugin vault key`)
     }
     return value
   })
@@ -229,6 +232,18 @@ try {
     const secret = process.env[name]
     if (secret) assert.equal(serialized.includes(secret), false, `${name} leaked into status`)
   }
+
+  // Vault RPC methods are registered on the real server and reject invalid input
+  // without storing anything; clearing an absent key is a safe no-op.
+  await assert.rejects(
+    call("setAccountKey", { providerID: "apimaster", key: "x" }),
+    /setAccountKey/u,
+  )
+  await assert.rejects(
+    call("setAccountKey", { providerID: "plusvibe", key: "" }),
+    /setAccountKey/u,
+  )
+  assert.deepEqual(await call("clearAccountKey", { providerID: "openrouter" }), { cleared: false })
 
   const candidate = status.groups[0].candidates[0].model
   const selected = await call("select", { sessionID, model: candidate })

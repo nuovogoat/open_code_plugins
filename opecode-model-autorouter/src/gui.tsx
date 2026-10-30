@@ -2,6 +2,7 @@ import { Command, Plugin, SettingsPage, Style, createLatest } from "@opencode/pl
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
 import { ModelAutoRouterRpc } from "../rpc.ts"
 import {
+  VAULT_PROVIDER_IDS,
   catalogPrice,
   formatBalance,
   formatLatency,
@@ -42,6 +43,14 @@ interface RouterClient {
   status(input: Record<string, never>, options: RouterOptions): Promise<RouterStatus>
   rescan(input: Record<string, never>, options: RouterOptions): Promise<RouterStatus>
   configure(input: ConfigurePatch, options: RouterOptions): Promise<RouterStatus>
+  setAccountKey(
+    input: { providerID: string; key: string },
+    options: RouterOptions,
+  ): Promise<{ stored: boolean; providerID: string }>
+  clearAccountKey(
+    input: { providerID: string },
+    options: RouterOptions,
+  ): Promise<{ cleared: boolean }>
   select(
     input: { sessionID: string; model: string },
     options: RouterOptions,
@@ -80,6 +89,8 @@ export default Plugin.define({
       const [editorStrategy, setEditorStrategy] = createSignal<Strategy>("manual")
       const [editorModels, setEditorModels] = createSignal<string[]>([])
       const [groupSearch, setGroupSearch] = createSignal("")
+      const [keyProvider, setKeyProvider] = createSignal("")
+      const [keyDraft, setKeyDraft] = createSignal("")
 
       const selectedSession = () => {
         const sessions = ctx.sessions.list()
@@ -205,6 +216,33 @@ export default Plugin.define({
         void scoped(
           (rpc, options) => rpc.select({ sessionID: session.id, model: ref }, options),
           `Выбрана модель ${ref}`,
+        )
+      }
+
+      const saveAccountKey = async () => {
+        const providerID = keyProvider()
+        const key = keyDraft()
+        if (!providerID || !key.trim()) return
+        const saved = await scoped(
+          (rpc, options) => rpc.setAccountKey({ providerID, key }, options),
+          `Ключ ${providerID} сохранён в зашифрованном хранилище плагина`,
+        )
+        if (saved) {
+          setKeyProvider("")
+          setKeyDraft("")
+        }
+      }
+
+      const clearAccountKey = async (providerID: string) => {
+        if (!(await ctx.dialogs.confirm({
+          title: `Удалить ключ плагина для ${providerID}?`,
+          description: "Роутер вернётся к ключу из connections OpenCode, если он там есть. Тарифы и баланс обновятся при следующем сканировании.",
+          confirm: "Удалить",
+          danger: true,
+        }))) return
+        await scoped(
+          (rpc, options) => rpc.clearAccountKey({ providerID }, options),
+          `Ключ плагина для ${providerID} удалён`,
         )
       }
 
@@ -411,7 +449,7 @@ export default Plugin.define({
             <section class="mar-panel">
               <div class="mar-panel-body">
                 <h3>Аккаунты провайдеров</h3>
-                <p class="mar-help">Баланс и тарифы запрашиваются серверной частью из аккаунтных API провайдеров по сохранённому в OpenCode ключу. Ключ не отображается в GUI, не передаётся через RPC и не попадает в статус.</p>
+                <p class="mar-help">Баланс и тарифы запрашиваются серверной частью из аккаунтных API провайдеров. По умолчанию используется ключ из connections OpenCode; дополнительно можно сохранить аккаунтный ключ в зашифрованном хранилище плагина — он не передаётся OpenCode, не отображается в GUI и не попадает в статус.</p>
                 <div class="mar-account-list">
                   <For each={status()!.accounts}>{(account) => (
                     <div class="mar-account">
@@ -419,6 +457,12 @@ export default Plugin.define({
                       <span class="mar-badge" data-tone={account.state === "live" ? "free" : account.state === "stale" ? "warning" : undefined}>
                         {account.state === "live" ? "live" : account.state === "stale" ? "stale" : "unsupported"}
                       </span>
+                      <Show when={account.keySource === "plugin"}>
+                        <span class="mar-badge" data-tone="free" title="Аккаунтный ключ сохранён в зашифрованном хранилище плагина">ключ плагина</span>
+                      </Show>
+                      <Show when={account.keySource === "opencode"}>
+                        <span class="mar-badge" title="Ключ берётся из connections OpenCode">ключ OpenCode</span>
+                      </Show>
                       <span class="mar-account-balance" title={account.balanceSupported ? "Остаток средств из аккаунтного API" : "Аккаунтный API баланса не подтверждён"}>
                         {account.balanceSupported ? formatBalance(account.balance, account.balanceCurrency) : "—"}
                       </span>
@@ -428,12 +472,46 @@ export default Plugin.define({
                       <Show when={account.updatedAt}>
                         <span class="mar-muted">{new Date(account.updatedAt!).toLocaleTimeString("ru-RU")}</span>
                       </Show>
+                      <Show when={VAULT_PROVIDER_IDS.includes(account.providerID)}>
+                        <div class="mar-account-actions">
+                          <ctx.ui.Button
+                            size="small"
+                            variant="ghost"
+                            disabled={saving()}
+                            onClick={() => { setKeyProvider(account.providerID); setKeyDraft("") }}
+                          >
+                            {account.pluginKey ? "Заменить ключ" : "Задать ключ"}
+                          </ctx.ui.Button>
+                          <Show when={account.pluginKey}>
+                            <ctx.ui.Button size="small" variant="danger" disabled={saving()} onClick={() => void clearAccountKey(account.providerID)}>Удалить ключ</ctx.ui.Button>
+                          </Show>
+                        </div>
+                      </Show>
                     </div>
                   )}</For>
                   <Show when={status()!.accounts.length === 0}>
                     <div class="mar-empty">Подключённые провайдеры не предоставляют подтверждённый аккаунтный API: цены и баланс не показываются.</div>
                   </Show>
                 </div>
+                <Show when={keyProvider()}>
+                  <form class="mar-key-form" onSubmit={(event) => { event.preventDefault(); void saveAccountKey() }}>
+                    <ctx.ui.TextInput
+                      type="password"
+                      class="mar-key-input"
+                      label={`Аккаунтный ключ ${keyProvider()}`}
+                      placeholder="Аккаунтный ключ для аккаунтного API"
+                      value={keyDraft()}
+                      onInput={setKeyDraft}
+                      onSubmit={() => void saveAccountKey()}
+                      autofocus
+                    />
+                    <div class="mar-actions">
+                      <ctx.ui.Button variant="contrast" size="small" busy={saving()} onClick={() => void saveAccountKey()}>Сохранить ключ</ctx.ui.Button>
+                      <ctx.ui.Button variant="ghost" size="small" disabled={saving()} onClick={() => { setKeyProvider(""); setKeyDraft("") }}>Отмена</ctx.ui.Button>
+                    </div>
+                    <p class="mar-help">Ключ шифруется AES-256-GCM в хранилище плагина и отправляется только в аккаунтный API {keyProvider()}. Он не передаётся OpenCode и не отображается обратно.</p>
+                  </form>
+                </Show>
               </div>
             </section>
 

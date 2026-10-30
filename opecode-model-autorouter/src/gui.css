@@ -85,6 +85,10 @@
 .mar-account { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 12px; border: 1px solid var(--mar-border); border-radius: 8px; font-size: 11px; }
 .mar-account-name { overflow-wrap: anywhere; font-weight: 650; }
 .mar-account-balance { font-family: var(--font-family-mono, monospace); font-size: 12px; }
+.mar-account-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.mar-key-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; padding: 12px; border: 1px solid var(--mar-border); border-radius: 8px; }
+.mar-key-input { flex: 1 1 240px; min-width: 0; max-width: 420px; }
+.mar-key-form .mar-help { flex-basis: 100%; }
 .mar-group-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
 .mar-group-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--mar-border); border-radius: 8px; }
 .mar-group-card-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

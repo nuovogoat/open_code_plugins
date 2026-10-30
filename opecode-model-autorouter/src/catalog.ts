@@ -40,6 +40,14 @@ export interface ManualGroup {
   models: string[]
 }
 
+/**
+ * Providers whose account key can be stored in the plugin vault. Mirrors
+ * `VAULT_PROVIDERS` in vault.ts and the RPC enum in rpc.ts (kept in sync by
+ * test/vault.test.ts); vault.ts cannot be imported here because node:crypto
+ * must never reach the GUI bundle.
+ */
+export const VAULT_PROVIDER_IDS: readonly string[] = ["openrouter", "teamorouter", "plusvibe"]
+
 export interface AccountInfo {
   providerID: string
   state: "live" | "stale" | "unsupported"
@@ -49,6 +57,8 @@ export interface AccountInfo {
   matchedModels: number
   balance?: number
   balanceCurrency?: string
+  keySource?: "plugin" | "opencode"
+  pluginKey?: boolean
 }
 
 export interface RouterStatus {

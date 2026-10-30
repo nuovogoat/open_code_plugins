@@ -1,10 +1,12 @@
 import {
   loadAccountSnapshots,
   withAccountPricing,
+  type AccountKey,
   type AccountProvider,
   type AccountSnapshot,
   type ModelCost,
 } from "./pricing.ts"
+import { openAccountVault, VAULT_PROVIDERS, type AccountVault } from "./vault.ts"
 
 export type Strategy = "free-fastest" | "fastest" | "cheapest" | "manual"
 
@@ -465,6 +467,8 @@ export class ModelAutoRouter {
   private catalogModels: ModelInfo[] = []
   private models: ModelInfo[] = []
   private accounts: ReadonlyMap<string, AccountSnapshot> = new Map()
+  private vault: AccountVault | undefined
+  private vaultProviders = new Set<string>()
   private refreshing: Promise<void> | undefined
   private stopped = false
   private timer: ReturnType<typeof setInterval> | undefined
@@ -477,7 +481,17 @@ export class ModelAutoRouter {
     this.rpcDefinition = rpcDefinition
     this.configuredOptions = normalizeRouterOptions(ctx.options)
     this.options = normalizeRouterOptions(this.configuredOptions)
-    this.ready = this.loadOptions()
+    this.ready = this.init()
+  }
+
+  private async init(): Promise<void> {
+    try {
+      this.vault = await openAccountVault(this.ctx.storage)
+    } catch {
+      // Without a vault the OpenCode connections remain the only key source.
+      this.vault = undefined
+    }
+    await this.loadOptions()
   }
 
   private report(message: string): void {
@@ -566,21 +580,31 @@ export class ModelAutoRouter {
     )
   }
 
-  /** Resolves the account key server-side; the value is never logged, stored, or exposed via RPC/GUI. */
-  private async resolveAccountKey(integrationID: string): Promise<string | undefined> {
+  /**
+   * Resolves the account key server-side: the optional plugin vault wins over
+   * OpenCode connections because storing a key here is an explicit user choice.
+   * The value is never logged, stored in plain form, or exposed via RPC/GUI.
+   */
+  private async resolveAccountKey(provider: AccountProvider): Promise<AccountKey | undefined> {
+    try {
+      const vaultKey = await this.vault?.get(provider.id)
+      if (vaultKey) return { value: vaultKey, source: "plugin" }
+    } catch {
+      // A broken vault record falls back to the OpenCode connection.
+    }
     const integration = this.ctx.integration
     if (!integration) return undefined
     try {
-      const connection = await integration.connection.active(integrationID)
+      const connection = await integration.connection.active(provider.integrationID ?? provider.id)
       if (!connection) return undefined
       const credential = (await integration.connection.resolve(connection)) as
         | { type?: string; key?: string; access?: string }
         | undefined
       if (credential?.type === "key" && typeof credential.key === "string" && credential.key) {
-        return credential.key
+        return { value: credential.key, source: "opencode" }
       }
       if (credential?.type === "oauth" && typeof credential.access === "string" && credential.access) {
-        return credential.access
+        return { value: credential.access, source: "opencode" }
       }
       return undefined
     } catch {
@@ -590,15 +614,25 @@ export class ModelAutoRouter {
 
   private async updateAccounts(): Promise<void> {
     try {
-      const snapshots = this.ctx.pricing
-        ? await this.ctx.pricing.load(this.lifecycle.signal)
-        : await loadAccountSnapshots(
-            globalThis.fetch,
-            this.lifecycle.signal,
-            (this.ctx.provider ? await this.ctx.provider.list() : { data: [] }).data,
-            (integrationID) => this.resolveAccountKey(integrationID),
-            this.accounts,
-          )
+      if (this.ctx.pricing) {
+        const snapshots = await this.ctx.pricing.load(this.lifecycle.signal)
+        if (this.stopped) return
+        this.accounts = new Map(snapshots.map((snapshot) => [snapshot.providerID, snapshot]))
+        return
+      }
+      const listed = this.ctx.provider ? await this.ctx.provider.list() : { data: [] as AccountProvider[] }
+      const vaultIDs = (await this.vault?.providers()) ?? []
+      if (this.stopped) return
+      this.vaultProviders = new Set(vaultIDs)
+      const snapshots = await loadAccountSnapshots(
+        globalThis.fetch,
+        this.lifecycle.signal,
+        // Providers with a confirmed account API always surface, so the optional
+        // vault key can be set even without an OpenCode connection.
+        [...listed.data, ...VAULT_PROVIDERS.map((id) => ({ id })), ...vaultIDs.map((id) => ({ id }))],
+        (provider) => this.resolveAccountKey(provider),
+        this.accounts,
+      )
       if (this.stopped) return
       this.accounts = new Map(snapshots.map((snapshot) => [snapshot.providerID, snapshot]))
     } catch {
@@ -955,6 +989,8 @@ export class ModelAutoRouter {
           matchedModels: matched,
           balance: snapshot.balance?.amount,
           balanceCurrency: snapshot.balance?.currency,
+          keySource: snapshot.keySource,
+          pluginKey: this.vaultProviders.has(snapshot.providerID) || undefined,
         })
       }),
       disabledModels: [...disabled].sort(),
@@ -1066,6 +1102,25 @@ export class ModelAutoRouter {
             const { reset = false, ...patch } = input
             return this.configure(patch, reset)
           },
+          setAccountKey: async (input: { providerID: string; key: string }) => {
+            await this.ready
+            if (this.stopped) throw new Error("router is unavailable")
+            if (!this.vault) throw new Error("plugin storage is unavailable")
+            // The key is encrypted at rest and never echoed back or logged.
+            await this.vault.set(input.providerID, input.key)
+            this.vaultProviders.add(input.providerID)
+            await this.refresh()
+            return { stored: true, providerID: input.providerID }
+          },
+          clearAccountKey: async (input: { providerID: string }) => {
+            await this.ready
+            if (this.stopped) throw new Error("router is unavailable")
+            if (!this.vault) throw new Error("plugin storage is unavailable")
+            const cleared = await this.vault.clear(input.providerID)
+            if (cleared) this.vaultProviders.delete(input.providerID)
+            await this.refresh()
+            return { cleared }
+          },
           select: async (input: { sessionID: string; model: string }) => {
             await this.ready
             const ref = parseRef(input.model)
@@ -1118,6 +1173,8 @@ export class ModelAutoRouter {
     this.activity.clear()
     this.failedExecutions.clear()
     this.cooldowns.clear()
+    this.vault = undefined
+    this.vaultProviders.clear()
   }
 }
 

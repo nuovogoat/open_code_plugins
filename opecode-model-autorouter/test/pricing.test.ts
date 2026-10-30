@@ -216,10 +216,11 @@ test("accounts: supported providers load live snapshots over their fixed API ori
       { id: "teamorouter", integrationID: "teamorouter" },
       { id: "plusvibe" },
     ],
-    async (integrationID) => `key-for-${integrationID}`,
+    async (provider) => ({ value: `key-for-${provider.id}`, source: "opencode" }),
   )
   const byProvider = new Map(snapshots.map((snapshot) => [snapshot.providerID, snapshot]))
   assert.equal(byProvider.get("teamorouter")?.state, "live")
+  assert.equal(byProvider.get("teamorouter")?.keySource, "opencode")
   assert.deepEqual(byProvider.get("teamorouter")?.balance, { amount: 9.8, currency: "USD" })
   assert.equal(byProvider.get("teamorouter")?.costs.get("claude-haiku")?.cost[0].input, 1)
   assert.equal(byProvider.get("plusvibe")?.state, "live")
@@ -242,7 +243,7 @@ test("accounts: providers without a confirmed account API stay unsupported witho
     fetcher({}, requests),
     new AbortController().signal,
     [{ id: "opencode" }, { id: "apimaster" }],
-    async () => "unused",
+    async () => ({ value: "unused", source: "opencode" }),
   )
   assert.deepEqual(
     snapshots.map((snapshot) => [snapshot.providerID, snapshot.state]),
@@ -281,7 +282,7 @@ test("accounts: refresh failures fall back to the previous snapshot marked stale
     fetcher({}, []),
     new AbortController().signal,
     [{ id: "plusvibe" }],
-    async () => "key",
+    async () => ({ value: "key", source: "plugin" }),
     previous,
   )
   assert.equal(snapshots[0].state, "stale")
@@ -298,7 +299,7 @@ test("accounts: aborting the refresh rejects instead of caching partial data", a
       fetcher({}, []),
       controller.signal,
       [{ id: "teamorouter" }],
-      async () => "key",
+      async () => ({ value: "key", source: "opencode" }),
     ),
   )
 })

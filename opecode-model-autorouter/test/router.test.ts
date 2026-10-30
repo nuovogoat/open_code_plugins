@@ -395,6 +395,66 @@ test("accounts: an unsupported provider account leaves models without a fabricat
   }
 })
 
+test("vault: a plugin-stored key feeds the account API without ever being exposed", async () => {
+  const ctx = fakeContext([model("teamorouter", "same", 8)])
+  // Force the production account path: no pricing override and no OpenCode integration.
+  delete ctx.pricing
+  ctx.provider = { async list() { return { data: [] } } }
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    requests.push({ url: String(url), init })
+    const body = String(url) === "https://api.teamorouter.com/v1/models/config"
+      ? { models: { providers: { anthropic: { models: [{ id: "same", cost: { input: 1, output: 5 } }] } } } }
+      : { data: { available_balance: "9.8", currency: "USD" } }
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.setAccountKey !== undefined)
+    const stored = await ctx.rpcHandlers.setAccountKey({ providerID: "teamorouter", key: "vault-secret-key" })
+    assert.deepEqual(stored, { stored: true, providerID: "teamorouter" })
+
+    const status = (await ctx.rpcHandlers.status({})) as any
+    const account = status.accounts.find((item: any) => item.providerID === "teamorouter")
+    assert.equal(account.state, "live")
+    assert.equal(account.keySource, "plugin")
+    assert.equal(account.pluginKey, true)
+    assert.equal(account.balance, 9.8)
+    assert.equal(account.matchedModels, 1)
+    assert.equal(status.models[0].cost[0].input, 1)
+    assert.equal(status.models[0].costCurrency, "USD")
+
+    // The secret never surfaces in the status payload or in any persisted record.
+    assert.equal(JSON.stringify(status).includes("vault-secret-key"), false)
+    for (const value of ctx.storageValues.values()) {
+      assert.equal(JSON.stringify(value).includes("vault-secret-key"), false)
+    }
+    // The key only travels to the hardcoded teamorouter account API origin.
+    assert.ok(requests.length >= 2)
+    for (const request of requests) {
+      assert.match(request.url, /^https:\/\/api\.teamorouter\.com\//u)
+      assert.equal(new Headers(request.init?.headers).get("authorization"), "Bearer vault-secret-key")
+    }
+
+    // Clearing the vault key stops requests and reports stale without a key source.
+    requests.length = 0
+    assert.deepEqual(await ctx.rpcHandlers.clearAccountKey({ providerID: "teamorouter" }), { cleared: true })
+    const after = (await ctx.rpcHandlers.status({})) as any
+    const clearedAccount = after.accounts.find((item: any) => item.providerID === "teamorouter")
+    assert.equal(clearedAccount.state, "stale")
+    assert.equal(clearedAccount.keySource, undefined)
+    assert.equal(clearedAccount.pluginKey, undefined)
+    assert.equal(requests.length, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
 test("configuration: disabling the current model routes the next prompt to an alternative", async () => {
   const ctx = fakeContext([model("a"), model("b")])
   const cleanup = setupModelAutoRouter(ctx, {})

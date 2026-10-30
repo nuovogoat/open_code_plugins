@@ -133,6 +133,8 @@ const status = {
           matchedModels: { type: "number" },
           balance: { type: "number" },
           balanceCurrency: { type: "string" },
+          keySource: { type: "string", enum: ["plugin", "opencode"] },
+          pluginKey: { type: "boolean" },
         },
         required: ["providerID", "state", "pricingSupported", "balanceSupported", "matchedModels"],
         additionalProperties: false,
@@ -238,6 +240,41 @@ export const ModelAutoRouterRpc = Rpc.define({
     status: { input: empty, output: status },
     rescan: { input: empty, output: status },
     configure: { input: configure, output: status },
+    setAccountKey: {
+      input: {
+        type: "object",
+        properties: {
+          // Providers with a confirmed account API; the key only travels to their hardcoded origin.
+          providerID: { type: "string", enum: ["openrouter", "teamorouter", "plusvibe"] },
+          key: { type: "string", minLength: 1, maxLength: 512 },
+        },
+        required: ["providerID", "key"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: {
+          stored: { type: "boolean" },
+          providerID: { type: "string" },
+        },
+        required: ["stored", "providerID"],
+        additionalProperties: false,
+      },
+    },
+    clearAccountKey: {
+      input: {
+        type: "object",
+        properties: { providerID: { type: "string" } },
+        required: ["providerID"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { cleared: { type: "boolean" } },
+        required: ["cleared"],
+        additionalProperties: false,
+      },
+    },
     select: {
       input: {
         type: "object",
