@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
 import test from "node:test"
 import { openAccountVault, VAULT_PROVIDERS, type VaultStorage } from "../vault.ts"
-import { ModelAutoRouterRpc } from "../rpc.ts"
 import { VAULT_PROVIDER_IDS } from "../src/catalog.ts"
 
 function memoryStorage(): VaultStorage & { values: Map<string, unknown> } {
@@ -92,12 +92,13 @@ test("vault: without plugin storage the vault stays disabled", async () => {
   assert.equal(await openAccountVault(undefined), undefined)
 })
 
-test("vault: provider lists stay in sync across vault, RPC schema and GUI catalog", () => {
-  const rpcEnum = (
-    ModelAutoRouterRpc.methods.setAccountKey.input as unknown as {
-      properties: { providerID: { enum: readonly string[] } }
-    }
-  ).properties.providerID.enum
-  assert.deepEqual([...rpcEnum], [...VAULT_PROVIDERS])
+test("vault: provider lists stay in sync across vault, RPC schema and GUI catalog", async () => {
+  // rpc.ts is parsed as source because unit tests run hermetically in CI
+  // without installing @opencode/plugin; a missing enum fails this test loudly.
+  const source = await readFile(new URL("../rpc.ts", import.meta.url), "utf8")
+  const match = source.match(/providerID:\s*\{\s*type:\s*"string",\s*enum:\s*\[([^\]]*)\]/u)
+  assert.ok(match, "rpc.ts setAccountKey providerID enum was not found")
+  const rpcEnum = match[1].split(",").map((item) => item.trim().replace(/^"|"$/gu, ""))
+  assert.deepEqual(rpcEnum, [...VAULT_PROVIDERS])
   assert.deepEqual([...VAULT_PROVIDER_IDS], [...VAULT_PROVIDERS])
 })
