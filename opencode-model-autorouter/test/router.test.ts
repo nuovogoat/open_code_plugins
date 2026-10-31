@@ -408,6 +408,7 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
   const ctx = fakeContext([model("teamorouter", "same", 8)])
   // Force the production account path: no pricing override and no OpenCode integration.
   delete ctx.pricing
+
   const requests: Array<{ url: string; init?: RequestInit }> = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
