@@ -1481,9 +1481,17 @@ export class ModelAutoRouter {
             const roster = [...new Set([...listed.data.map((p) => p.id), ...vaultIDs])]
             await this.vault.set(input.providerID, input.key, roster)
             this.vaultProviders.add(input.providerID)
-            // Reset the debounce guard so refresh() runs a full cycle with the new key.
-            this.refreshing = undefined
-            await this.refresh()
+            // Directly update accounts so the new key is visible immediately,
+            // without waiting for the debounced refresh() cycle.
+            await this.updateAccounts()
+            // Rebuild models/groups with updated account data.
+            this.models = withPublicPricing(
+              withAccountPricing(this.catalogModels, this.accounts),
+              this.publicPricing,
+            )
+            this.rebuildGroups()
+            // Also trigger a background refresh for CBR/public pricing consistency.
+            void this.refresh()
             return { stored: true, providerID: input.providerID }
           },
           clearAccountKey: async (input: { providerID: string }) => {
