@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises"
 import plugin from "../index.ts"
 
 // Run with node_modules installed: this loads the actual SDK selected by the manifest.
-assert.equal(plugin.id, "opecode-model-autorouter")
+assert.equal(plugin.id, "opencode-model-autorouter")
 assert.equal(typeof plugin.setup, "function")
 
 const hooks = new Map<string, (event: any) => void | Promise<void>>()
@@ -60,7 +60,7 @@ const cleanup = await plugin.setup({
   },
   rpc: {
     async register(definition: { id?: string }, handlers: Record<string, (input: any) => Promise<any>>) {
-      assert.equal(definition.id, "opecode-model-autorouter")
+      assert.equal(definition.id, "opencode-model-autorouter")
       Object.assign(rpcHandlers, handlers)
       return registration()
     },

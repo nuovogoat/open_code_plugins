@@ -45,11 +45,11 @@ function machineContext(): string {
   } catch {
     // Some environments have no user info; the salt still binds the secret.
   }
-  return `${hostname()}|${user}|opecode-model-autorouter`
+  return `${hostname()}|${user}|opencode-model-autorouter`
 }
 
 function deriveKey(salt: string): Buffer {
-  return scryptSync(`${salt}|${machineContext()}`, "opecode-model-autorouter-vault", 32)
+  return scryptSync(`${salt}|${machineContext()}`, "opencode-model-autorouter-vault", 32)
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

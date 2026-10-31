@@ -117,7 +117,7 @@ async function call(method: string, input: unknown = {}): Promise<any> {
   const output = await run([
     "api",
     "post",
-    `/api/rpc/opecode-model-autorouter/${method}?${location}`,
+    `/api/rpc/opencode-model-autorouter/${method}?${location}`,
     "--data",
     JSON.stringify({ input }),
   ])
@@ -149,7 +149,7 @@ try {
 
   await eventually(async () => {
     const plugins = JSON.parse(await run(["api", "get", `/api/plugin?${location}`]))
-    const plugin = plugins.data?.find?.((item: any) => item.id === "opecode-model-autorouter")
+    const plugin = plugins.data?.find?.((item: any) => item.id === "opencode-model-autorouter")
     assert.equal(plugin?.state?.status, "active", JSON.stringify(plugin ?? plugins))
     assert.equal(plugin?.features?.gui, true, JSON.stringify(plugin))
   })
@@ -157,7 +157,7 @@ try {
     await run([
       "api",
       "get",
-      `/api/plugin/gui?id=opecode-model-autorouter&${location}`,
+      `/api/plugin/gui?id=opencode-model-autorouter&${location}`,
     ]),
   )
   assert.ok(gui.data.code.includes("Model Autorouter"))

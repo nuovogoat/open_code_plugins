@@ -693,7 +693,7 @@ export class ModelAutoRouter {
   }
 
   private report(message: string): void {
-    console.error(`[opecode-model-autorouter] ${message}`)
+    console.error(`[opencode-model-autorouter] ${message}`)
   }
 
   private replaceOptions(options: RouterOptions): void {
@@ -1001,7 +1001,7 @@ export class ModelAutoRouter {
   private async routePrompt(event: any): Promise<void> {
     const sessionID = event?.sessionID
     if (this.stopped || this.options.enabled === false || typeof sessionID !== "string") return
-    if (event?.metadata?.source === "opecode-model-autorouter") return
+    if (event?.metadata?.source === "opencode-model-autorouter") return
     const token = this.touch(sessionID)
     this.pending.delete(sessionID)
     this.attempts.delete(sessionID)
@@ -1204,7 +1204,7 @@ export class ModelAutoRouter {
         sessionID,
         text: CONTINUE_TEXT,
         description: "Continue after model provider failover",
-        metadata: { source: "opecode-model-autorouter", providerID: pending.providerID, modelID: pending.id },
+        metadata: { source: "opencode-model-autorouter", providerID: pending.providerID, modelID: pending.id },
         resume: true,
       })
     } catch {

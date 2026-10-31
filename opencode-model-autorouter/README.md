@@ -1,4 +1,4 @@
-# opecode-model-autorouter
+# opencode-model-autorouter
 
 Плагин OpenCode V2 с GUI для маршрутизации между эквивалентными chat-моделями разных провайдеров. Учитывает фактические скорость и стоимость завершённых шагов, аккаунтные тарифы и остаток средств из API провайдеров, публичные цены с сайтов провайдеров без входа в аккаунт, приоритет бесплатных моделей и временную недоступность после ошибок лимита.
 
@@ -22,7 +22,7 @@
 ## Установка и обновление
 
 ```sh
-opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:opecode-model-autorouter'
+opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:opencode-model-autorouter'
 opencode plugin check
 opencode plugin update
 ```
@@ -30,7 +30,7 @@ opencode plugin update
 Фиксированная версия:
 
 ```sh
-opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter/v0.6.0::path:opecode-model-autorouter'
+opencode plugin add 'github:nuovogoat/open_code_plugins#opencode-model-autorouter/v0.7.0::path:opencode-model-autorouter'
 ```
 
 История версий: [CHANGELOG.md](CHANGELOG.md).
@@ -46,7 +46,7 @@ opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./opecode-model-autorouter",
+      "package": "./opencode-model-autorouter",
       "options": {
         "enabled": true,
         "autoDiscover": true,
@@ -148,7 +148,7 @@ opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter
 Например, через HTTP API текущего сервера (каталог проекта подставляется в `location[directory]`):
 
 ```sh
-opencode api post '/api/rpc/opecode-model-autorouter/status?location%5Bdirectory%5D=C%3A%5Cpath%5Cto%5Cproject' --data '{"input":{}}'
+opencode api post '/api/rpc/opencode-model-autorouter/status?location%5Bdirectory%5D=C%3A%5Cpath%5Cto%5Cproject' --data '{"input":{}}'
 ```
 
 Ответ находится в поле `output`. Те же методы доступны через `ctx.rpc` и `@opencode/client` без ручного формирования HTTP-обёртки.

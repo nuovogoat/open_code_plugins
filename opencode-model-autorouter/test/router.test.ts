@@ -717,7 +717,7 @@ test("failover: synthetic activity is routed without cancelling the failover att
     const switchesBefore = ctx.switches.length
     await ctx.hooks.get("prompt")!({
       sessionID: "ses",
-      metadata: { source: "opecode-model-autorouter" },
+      metadata: { source: "opencode-model-autorouter" },
     })
     assert.equal(ctx.switches.length, switchesBefore)
     await ctx.hooks.get("retry")!({

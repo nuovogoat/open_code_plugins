@@ -306,7 +306,7 @@ const configure = {
 } as const
 
 export const ModelAutoRouterRpc = Rpc.define({
-  id: "opecode-model-autorouter",
+  id: "opencode-model-autorouter",
   methods: {
     status: { input: empty, output: status },
     rescan: { input: empty, output: status },

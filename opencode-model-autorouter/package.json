@@ -1,6 +1,6 @@
 {
-  "name": "opecode-model-autorouter",
-  "version": "0.6.0",
+  "name": "opencode-model-autorouter",
+  "version": "0.7.0",
   "description": "Route equivalent OpenCode models by live speed, cost and provider availability",
   "private": true,
   "type": "module",

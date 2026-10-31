@@ -36,7 +36,7 @@ assert.equal(typeof definition?.setup, "function")
 
 const contributions: unknown[] = []
 definition!.setup!({
-  id: "opecode-model-autorouter",
+  id: "opencode-model-autorouter",
   add(_registry: unknown, item: unknown) {
     contributions.push(item)
     return () => {}
@@ -50,7 +50,7 @@ const page = contributions.find(
     "title" in item &&
     item.title === "Model Autorouter",
 )
-assert.equal(page?.id, "opecode-model-autorouter")
+assert.equal(page?.id, "opencode-model-autorouter")
 assert.equal(typeof page?.render, "function")
 assert.ok(
   contributions.some(
