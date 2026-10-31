@@ -413,6 +413,11 @@ export default Plugin.define({
         siteDrafts()[providerID] ?? status()?.providerSites?.[providerID] ?? ""
       const publicInfo = (providerID: string) =>
         status()?.publicPricing.find((item) => item.providerID === providerID)
+      /** Only providers with a confirmed account API can consume a vault key. */
+      const accountCapable = (providerID: string) => {
+        const account = status()?.accounts.find((item) => item.providerID === providerID)
+        return Boolean(account && (account.pricingSupported || account.balanceSupported))
+      }
       const saveSite = async (providerID: string) => {
         const text = siteDraft(providerID).trim()
         const sites: Record<string, string> = { ...(status()?.providerSites ?? {}) }
@@ -814,7 +819,7 @@ export default Plugin.define({
                     >
                       {siteDraft(providerID).trim() === "" && status()?.providerSites?.[providerID] ? "Удалить адрес" : "Сохранить адрес"}
                     </ctx.ui.Button>
-                    <Show when={!status()?.accounts.find((account) => account.providerID === providerID)?.pluginKey}>
+                    <Show when={accountCapable(providerID) && !status()?.accounts.find((account) => account.providerID === providerID)?.pluginKey}>
                       <ctx.ui.Button
                         size="small"
                         variant="ghost"

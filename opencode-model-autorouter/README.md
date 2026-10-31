@@ -30,7 +30,7 @@ opencode plugin update
 Фиксированная версия:
 
 ```sh
-opencode plugin add 'github:nuovogoat/open_code_plugins#opencode-model-autorouter/v0.8.0::path:opencode-model-autorouter'
+opencode plugin add 'github:nuovogoat/open_code_plugins#opencode-model-autorouter/v0.8.1::path:opencode-model-autorouter'
 ```
 
 История версий: [CHANGELOG.md](CHANGELOG.md).
