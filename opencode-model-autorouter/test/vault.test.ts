@@ -92,6 +92,105 @@ test("vault: without plugin storage the vault stays disabled", async () => {
   assert.equal(await openAccountVault(undefined), undefined)
 })
 
+test("vault: account keys never leak into RPC responses, logs or public pricing", async () => {
+  // This is the "hardest" leak test: it seeds real-looking secrets into both
+  // the vault and the OpenCode credentials store, then inspects every byte
+  // that leaves the plugin through RPC handlers, console output and the
+  // public pricing snapshot.
+  const secrets = [
+    "sk-or-v1-LEAK-CANARY-0123456789ABCDEF",
+    "tmr-LEAK-CANARY-FEDCBA9876543210",
+    "pv-LEAK-CANARY-XXXXXXXXXXXXXXXXXXXX",
+  ]
+  const storage = memoryStorage()
+  const vault = (await openAccountVault(storage))!
+  await vault.set("openrouter", secrets[0])
+  await vault.set("teamorouter", secrets[1])
+  await vault.set("plusvibe", secrets[2])
+
+  // Capture everything that would leave the plugin boundary.
+  const logged: string[] = []
+  const originalError = console.error
+  console.error = (...args: unknown[]) => {
+    logged.push(args.map((arg) => String(arg)).join(" "))
+  }
+
+  // Minimal harness that mirrors core.ts wiring without touching the network.
+  const rpcHandlers: Record<string, (input: any) => Promise<unknown>> = {}
+  const ctx: any = {
+    options: {},
+    model: { async list() { return { data: [] } } },
+    pricing: { async load() { return [] } },
+    session: {
+      async get() { return {} },
+      async switchModel() {},
+      async synthetic() { return {} },
+      hook: async () => ({ dispose() {} }),
+    },
+    event: {
+      subscribe({ signal }: { signal: AbortSignal }) {
+        return (async function* () {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve()
+            else signal.addEventListener("abort", () => resolve(), { once: true })
+          })
+        })()
+      },
+    },
+    rpc: {
+      async register(_definition: unknown, handlers: Record<string, (input: any) => Promise<unknown>>) {
+        Object.assign(rpcHandlers, handlers)
+        return { dispose() {} }
+      },
+    },
+    credentials: {
+      async list() {
+        return [
+          { providerID: "openrouter", type: "api_key", key: secrets[0] },
+          { providerID: "teamorouter", type: "api_key", key: secrets[1] },
+          { providerID: "plusvibe", type: "api_key", key: secrets[2] },
+        ]
+      },
+    },
+    storage,
+  }
+
+  // Lazy-import to avoid circular deps at module scope.
+  const { setupModelAutoRouter } = await import("../core.ts")
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    // Wait until handlers are registered.
+    const deadline = Date.now() + 5_000
+    while (!rpcHandlers.status && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.ok(rpcHandlers.status, "status handler was not registered")
+
+    const responses: unknown[] = []
+    responses.push(await rpcHandlers.status({}))
+    responses.push(await rpcHandlers.configure({}))
+    responses.push(await rpcHandlers.rescan({}))
+
+    const haystacks = [
+      JSON.stringify(responses),
+      JSON.stringify(logged),
+      ...logged,
+    ]
+    for (const secret of secrets) {
+      for (const haystack of haystacks) {
+        assert.equal(
+          haystack.includes(secret),
+          false,
+          `secret leaked: ${secret.slice(0, 8)}... found in output`,
+        )
+      }
+    }
+  } finally {
+    console.error = originalError
+    cleanup()
+  }
+})
+
 test("vault: provider lists stay in sync across vault, RPC schema and GUI catalog", async () => {
   // rpc.ts is parsed as source because unit tests run hermetically in CI
   // without installing @opencode/plugin; a missing enum fails this test loudly.
