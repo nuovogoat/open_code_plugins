@@ -431,12 +431,13 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
     assert.deepEqual(stored, { stored: true, providerID: "teamorouter" })
 
     // setAccountKey triggers updateAccounts() directly; wait for the live account.
-    let status: any
+    let status: Record<string, unknown> | undefined
     const deadline = Date.now() + 10_000
     while (Date.now() < deadline) {
-      const s = await ctx.rpcHandlers.status({})
-      if (s && Array.isArray(s.accounts)) {
-        const acc = s.accounts.find((item: any) => item.providerID === "teamorouter")
+      const s = (await ctx.rpcHandlers.status({})) as Record<string, unknown> | undefined
+      const accounts = s?.accounts as Array<Record<string, unknown>> | undefined
+      if (s && Array.isArray(accounts)) {
+        const acc = accounts.find((item) => item.providerID === "teamorouter")
         if (acc?.state === "live") {
           status = s
           break
@@ -445,14 +446,18 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
     assert.ok(status, "account did not reach live state within timeout")
-    const account = status.accounts.find((item: any) => item.providerID === "teamorouter")
-    assert.equal(account.state, "live")
-    assert.equal(account.keySource, "plugin")
-    assert.equal(account.pluginKey, true)
-    assert.equal(account.balance, 9.8)
-    assert.equal(account.matchedModels, 1)
-    assert.equal(status.models[0].cost[0].input, 1)
-    assert.equal(status.models[0].costCurrency, "USD")
+    const accounts = status!.accounts as Array<Record<string, unknown>>
+    const account = accounts.find((item) => item.providerID === "teamorouter")
+    assert.ok(account, "teamorouter account not found in status")
+    assert.equal(account!.state, "live")
+    assert.equal(account!.keySource, "plugin")
+    assert.equal(account!.pluginKey, true)
+    assert.equal(account!.balance, 9.8)
+    assert.equal(account!.matchedModels, 1)
+    const models = status!.models as Array<Record<string, unknown>>
+    const cost = models[0].cost as Array<Record<string, unknown>>
+    assert.equal(cost[0].input, 1)
+    assert.equal(models[0].costCurrency, "USD")
 
     // The secret never surfaces in the status payload or in any persisted record.
     assert.equal(JSON.stringify(status).includes("vault-secret-key"), false)
