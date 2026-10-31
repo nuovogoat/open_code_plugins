@@ -424,7 +424,13 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
     })
     assert.deepEqual(stored, { stored: true, providerID: "teamorouter" })
 
-    const status = (await ctx.rpcHandlers.status({})) as any
+    // refresh() inside setAccountKey is async; wait for the account to go live.
+    const status = await eventually(async () => {
+      const s = (await ctx.rpcHandlers.status({})) as any
+      const acc = s.accounts.find((item: any) => item.providerID === "teamorouter")
+      if (acc?.state !== "live") throw new Error("not live yet")
+      return s
+    })
     const account = status.accounts.find((item: any) => item.providerID === "teamorouter")
     assert.equal(account.state, "live")
     assert.equal(account.keySource, "plugin")
