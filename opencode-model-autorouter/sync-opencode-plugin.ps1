@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
-$src = "C:\Tools\open_code_session_marker\opencode-model-autorouter"
-$dst = "C:\Users\Honor\.config\opencode\plugins\opencode-model-autorouter"
+# Portable: the source is the script's own folder, the destination is derived
+# from the user profile (no machine-specific literals, standards §0.12).
+$src = $PSScriptRoot
+$dst = Join-Path $env:USERPROFILE ".config/opencode/plugins/opencode-model-autorouter"
 if (-not (Test-Path $src)) { Write-Error "Source not found: $src"; exit 1 }
 if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
 # robocopy /MIR mirrors the tree: overwrites stale files and deletes extras

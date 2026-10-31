@@ -2,6 +2,8 @@
   "name": "opencode-model-autorouter",
   "version": "0.10.1",
   "description": "Route equivalent OpenCode models by live speed, cost and provider availability",
+  "license": "MIT",
+  "author": "nuovogoat",
   "private": true,
   "type": "module",
   "exports": {

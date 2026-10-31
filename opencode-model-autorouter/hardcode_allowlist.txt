@@ -1,0 +1,10 @@
+# Исключения хардкод-гейта (стандарт п. 0.12, гейт §8.2).
+# Формат строки: <файл> | <литерал> | <почему это пин>
+# Список минимален: гейт (test/hardcode.test.ts) падает и на неперечисленном
+# литерале пути/URL/endpoint'а в исходниках, и на строке, которой в коде уже нет.
+pricing.ts | https://openrouter.ai/api/v1 | пин §13: фиксированный origin аккаунтного API OpenRouter — единственный адрес, куда отправляется ключ
+pricing.ts | https://api.teamorouter.com/v1 | пин §13: фиксированный origin аккаунтного API TeamoRouter — единственный адрес, куда отправляется ключ
+pricing.ts | https://plusvibeapi.ru | пин §13: фиксированный origin аккаунтного API PlusVibe — единственный адрес, куда отправляется ключ
+pricing.ts | https://www.cbr.ru/scripts/XML_daily.asp | пин §0.12: публичный ежедневный API курсов ЦБ РФ, запрос без credentials
+src/gui.tsx | https://openrouter.ai | пример адреса в справочном тексте панели «Публичные цены без входа»; не endpoint — запросы идут на адрес из настройки providerSites
+src/gui.tsx | https://provider.example | placeholder-пример в тексте подсказки и сообщения об ошибке ввода; не endpoint
