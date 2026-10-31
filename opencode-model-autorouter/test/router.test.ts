@@ -124,7 +124,7 @@ test("routing: cheapest prefers measured cost and manual preserves configured pr
   assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "b")
 })
 
-test("routing: cheapest never numerically compares different currencies", () => {
+test("routing: cheapest never numerically compares different currencies without the ЦБ orientation", () => {
   const rub = model("rub", "same")
   rub.cost = [{ input: 1, output: 1 }]
   rub.costCurrency = "RUB"
@@ -138,6 +138,42 @@ test("routing: cheapest never numerically compares different currencies", () => 
     ["rub/same", metrics({ outputTokensPerSecond: 10 })],
   ])
   assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "usd")
+})
+
+test("routing: cheapest converts mixed currencies via ЦБ only when the orientation is enabled and rates are complete", () => {
+  const rub = model("rub", "same")
+  rub.cost = [{ input: 1, output: 1 }]
+  rub.costCurrency = "RUB"
+  const usd = model("usd", "same")
+  usd.cost = [{ input: 1000, output: 1000 }]
+  usd.costCurrency = "USD"
+  const group = buildRouteGroups([rub, usd], { strategy: "cheapest" }).get("auto:same")!
+  // Speed favors USD; only the converted price can make RUB win.
+  const stats = new Map<string, ModelMetrics>([
+    ["usd/same", metrics({ outputTokensPerSecond: 100 })],
+    ["rub/same", metrics({ outputTokensPerSecond: 10 })],
+  ])
+  const cbr = { date: "31.10.2026", rates: { RUB: 1, USD: 92.5123 }, fetchedAt: 0 }
+
+  // With rates: RUB 2 ≈ 2 ₽ vs USD 2000 × 92.5123 ≈ 185 024 ₽ → RUB is cheaper.
+  assert.equal(
+    selectCandidate(group, undefined, stats, new Map(), 0, new Set(), true, cbr)!.providerID,
+    "rub",
+  )
+  // Without the orientation the old fallback stands: measured speed decides.
+  assert.equal(selectCandidate(group, undefined, stats, new Map(), 0)!.providerID, "usd")
+  // A rate missing for any priced currency disables conversion entirely (nothing is invented).
+  const partial = { date: "31.10.2026", rates: { RUB: 1 }, fetchedAt: 0 }
+  assert.equal(
+    selectCandidate(group, undefined, stats, new Map(), 0, new Set(), true, partial)!.providerID,
+    "usd",
+  )
+  // A non-positive or non-finite rate is treated as missing, not as zero.
+  const broken = { date: "31.10.2026", rates: { RUB: 1, USD: 0 }, fetchedAt: 0 }
+  assert.equal(
+    selectCandidate(group, undefined, stats, new Map(), 0, new Set(), true, broken)!.providerID,
+    "usd",
+  )
 })
 
 test("routing: cooldown, tools and automatic context compatibility are enforced", () => {
@@ -1512,7 +1548,7 @@ test("public pricing: a changed site address is probed immediately despite failu
   }
 })
 
-test("cbr: orientation is opt-in, cached, display-only and cleared when switched off", async () => {
+test("cbr: orientation is opt-in, cached and cleared when switched off", async () => {
   const ctx = fakeContext([model("a", "same"), model("b", "same")])
   ctx.pricing = {
     async load() {
@@ -1554,6 +1590,52 @@ test("cbr: orientation is opt-in, cached, display-only and cleared when switched
     assert.equal(status.cbr, undefined)
     assert.equal(status.cbrOrientation, false)
     assert.equal(requests.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
+test("cbr: enabled orientation re-ranks mixed currencies in cheapest auto-switching", async () => {
+  // USD 2000/1M is numerically larger but RUB 2/1M is far cheaper once both
+  // are converted at the loaded rate (92.5123 ₽/$): 2 ₽ vs ≈185 024 ₽.
+  const ctx = fakeContext([model("usd", "same"), model("rub", "same")], {
+    strategy: "cheapest",
+    askBeforeOverride: false,
+  })
+  // Costs reach the router through account snapshots (the class strips native catalog costs).
+  ctx.pricing = {
+    async load() {
+      return [
+        accountSnapshot("usd", { same: { input: 1000, output: 1000 } }, "USD"),
+        accountSnapshot("rub", { same: { input: 1, output: 1 } }, "RUB"),
+      ]
+    },
+  }
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response(cbrXmlFixture, {
+      status: 200,
+      headers: { "content-type": "text/xml" },
+    })) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    // The session starts on usd/same. Without the orientation mixed currencies
+    // are not compared numerically: group order keeps the winner at usd.
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+
+    // Explicit opt-in: the converted price decides and the router auto-switches.
+    await ctx.rpcHandlers.configure({ cbrOrientation: true })
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    await eventually(() => ctx.switches.at(-1)?.model.providerID === "rub")
+
+    // Switching the orientation off clears the rates and the old winner returns.
+    await ctx.rpcHandlers.configure({ cbrOrientation: false })
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    await eventually(() => ctx.switches.at(-1)?.model.providerID === "usd")
   } finally {
     globalThis.fetch = originalFetch
     cleanup()

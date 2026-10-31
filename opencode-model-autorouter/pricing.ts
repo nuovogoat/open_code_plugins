@@ -391,8 +391,10 @@ export function parseCbrDaily(xml: string): Omit<CbrRates, "fetchedAt"> | undefi
 }
 
 /**
- * Display-only orientation source: the hardcoded public ЦБ РФ origin is called
- * without credentials and with the same guardrails as the account APIs.
+ * Orientation source: the hardcoded public ЦБ РФ origin is called without
+ * credentials and with the same guardrails as the account APIs. Rates are used
+ * for «≈» display and, when the orientation is opted in, for approximate
+ * mixed-currency comparison in the "cheapest" ranking.
  */
 export async function loadCbrRates(fetcher: typeof fetch, signal: AbortSignal): Promise<CbrRates> {
   const controller = new AbortController()

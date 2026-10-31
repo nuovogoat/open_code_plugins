@@ -577,6 +577,7 @@ export function selectCandidate(
   now: number,
   attempted: ReadonlySet<string> = new Set(),
   includeCurrent = true,
+  cbr?: CbrRates,
 ): Candidate | undefined {
   const currentInfo = current
     ? group.candidates.find((candidate) => sameRouteModel(candidate, current, group.automatic))?.info
@@ -631,7 +632,36 @@ export function selectCandidate(
       })[0]
     }
     if (currencies.size > 1) {
-      // No exchange-rate source is assumed: mixed currencies are never compared numerically.
+      // With the ЦБ РФ orientation explicitly enabled, mixed currencies are
+      // compared through conversion at the official rate. The estimate is
+      // approximate by nature: providers convert funds at their own rates, so
+      // actual spend can differ; it orders candidates, it is not a quote.
+      // If any priced currency lacks a loaded rate nothing is converted.
+      if (cbr) {
+        const rubles = new Map<Candidate, number>()
+        let complete = true
+        for (const candidate of candidates) {
+          const cost = costs.get(candidate)
+          if (!cost) {
+            rubles.set(candidate, Number.POSITIVE_INFINITY)
+            continue
+          }
+          const rate = cbr.rates[cost.currency]
+          if (rate === undefined || !Number.isFinite(rate) || rate <= 0) {
+            complete = false
+            break
+          }
+          rubles.set(candidate, cost.value * rate)
+        }
+        if (complete) {
+          return [...candidates].sort((a, b) => {
+            const diff = (rubles.get(a) ?? Number.POSITIVE_INFINITY) -
+              (rubles.get(b) ?? Number.POSITIVE_INFINITY)
+            return diff || compareSpeed(a, b)
+          })[0]
+        }
+      }
+      // No other exchange-rate source is assumed: mixed currencies are never compared numerically.
       return [...candidates].sort((a, b) => {
         const known = Number(Boolean(costs.get(b))) - Number(Boolean(costs.get(a)))
         return known || compareSpeed(a, b)
@@ -979,7 +1009,12 @@ export class ModelAutoRouter {
     this.groups = buildRouteGroups(this.models, this.options, this.thresholds.excluded)
   }
 
-  /** Opt-in display orientation; ЦБ РФ rates never influence routing or selection. */
+  /**
+   * Opt-in ЦБ РФ orientation: rates are shown as «≈» equivalents and, only
+   * while the orientation is enabled, approximate mixed-currency comparison in
+   * the "cheapest" ranking. Guardrails (price limits, balance thresholds) stay
+   * strictly in the account/price currency and never use conversion.
+   */
   private async updateCbr(): Promise<void> {
     if (this.options.cbrOrientation !== true) {
       this.cbr = undefined
@@ -1069,6 +1104,9 @@ export class ModelAutoRouter {
         this.metrics,
         this.cooldowns,
         Date.now(),
+        new Set(),
+        true,
+        this.cbr,
       )
       if (
         candidate &&
@@ -1202,6 +1240,7 @@ export class ModelAutoRouter {
         Date.now(),
         attempted,
         false,
+        this.cbr,
       )
       if (!candidate || !(await this.switchModel(sessionID, candidate))) return false
       if (
