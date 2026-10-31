@@ -1,11 +1,13 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  accountStepCost,
   buildRouteGroups,
   evaluateGuardrails,
   isLimitError,
   modelKey,
   parseRetryAfter,
+  parseStepTokens,
   selectCandidate,
   setupModelAutoRouter,
   type ModelInfo,
@@ -209,6 +211,40 @@ test("errors: quota signals are recognized without retaining provider response t
   assert.equal(isLimitError({ type: "provider.rate-limit" }), true)
   assert.equal(isLimitError({ message: "insufficient balance" }), true)
   assert.equal(isLimitError({ status: 500, message: "internal" }), false)
+})
+
+test("usage: step tokens are parsed defensively and priced only by declared tariff rates", () => {
+  // Garbage and negatives become zero; nothing is invented from bad shapes.
+  assert.deepEqual(parseStepTokens(undefined), { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 })
+  assert.deepEqual(parseStepTokens({ tokens: { input: -5, output: "10", cache: { read: null } } }), {
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+  })
+  assert.deepEqual(parseStepTokens({ tokens: { input: 3, output: 4, reasoning: 1, cache: { read: 5, write: 6 } } }), {
+    input: 3,
+    output: 4,
+    reasoning: 1,
+    cacheRead: 5,
+    cacheWrite: 6,
+  })
+
+  const tokens = { input: 1_000_000, output: 500_000, reasoning: 100_000, cacheRead: 2_000_000, cacheWrite: 10 }
+  // Per-million first tier: input 2, output 6; reasoning is billed at the output rate.
+  const close = (actual: number | undefined, expected: number) =>
+    assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`)
+  close(accountStepCost({ input: 2, output: 6 }, tokens), (2 * 1_000_000 + 6 * 600_000) / 1_000_000)
+  // Cache tokens are billed only when the tariff declares cache rates.
+  close(
+    accountStepCost({ input: 2, output: 6, cache: { read: 1, write: 3 } }, tokens),
+    (2 * 1_000_000 + 6 * 600_000 + 1 * 2_000_000 + 3 * 10) / 1_000_000,
+  )
+  // No tariff, or a broken one, yields no cost at all (the caller falls back or shows nothing).
+  assert.equal(accountStepCost(undefined, tokens), undefined)
+  assert.equal(accountStepCost({ input: Number.NaN, output: 6 }, tokens), undefined)
+  assert.equal(accountStepCost({ input: -1, output: 6 }, tokens), undefined)
 })
 
 interface FakeContext extends PluginContext {
@@ -547,6 +583,71 @@ test("vault: setAccountKey rejects providers without a confirmed account API eve
     )
   } finally {
     globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
+test("usage: finished steps accumulate tokens and cost by account tariff or measured USD", async () => {
+  const ctx = fakeContext([model("a", "same"), model("b", "same")])
+  // Provider "a" has a confirmed RUB tariff; "b" has none — its steps fall back
+  // to the cost OpenCode measured itself.
+  ctx.pricing = {
+    async load() {
+      return [accountSnapshot("a", { same: { input: 2, output: 6 } }, "RUB")]
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  const step = (sessionID: string, providerID: string, tokens: unknown, cost?: number) => {
+    const assistantMessageID = `${sessionID}-m1`
+    ctx.emit({
+      type: "session.step.started",
+      data: { sessionID, assistantMessageID, model: { providerID, id: "same" } },
+    })
+    ctx.emit({
+      type: "session.step.ended",
+      data: { sessionID, assistantMessageID, model: { providerID, id: "same" }, tokens, cost },
+    })
+  }
+  try {
+    await eventually(() => ctx.rpcHandlers.status !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    step("ses-a", "a", { input: 1_000_000, output: 500_000, reasoning: 100_000, cache: { read: 2_000_000, write: 0 } })
+    step("ses-b", "b", { input: 10, output: 20 }, 0.005)
+    let status: any
+    await eventually(async () => {
+      const candidate = (await ctx.rpcHandlers.status({})) as any
+      if (candidate.usage.sessions.length === 2) {
+        status = candidate
+        return true
+      }
+      return false
+    })
+    const a = status.usage.sessions.find((item: any) => item.sessionID === "ses-a")
+    assert.deepEqual(a.tokens, { input: 1_000_000, output: 500_000, reasoning: 100_000, cacheRead: 2_000_000, cacheWrite: 0 })
+    assert.equal(a.model, "a/same")
+    // RUB tariff without cache rates: 2×1M input + 6×0.6M output; cache read is not billed.
+    assert.deepEqual(a.costs, [{ amount: 5.6, currency: "RUB", basis: "account" }])
+    const b = status.usage.sessions.find((item: any) => item.sessionID === "ses-b")
+    assert.deepEqual(b.costs, [{ amount: 0.005, currency: "USD", basis: "measured" }])
+    // Different currencies and bases never merge into one number.
+    assert.deepEqual(status.usage.totals, [
+      { amount: 5.6, currency: "RUB", basis: "account" },
+      { amount: 0.005, currency: "USD", basis: "measured" },
+    ])
+
+    // A deleted session loses its accumulated statistics.
+    ctx.emit({ type: "session.deleted", data: { sessionID: "ses-b" } })
+    let afterDelete: any
+    await eventually(async () => {
+      const candidate = (await ctx.rpcHandlers.status({})) as any
+      if (candidate.usage.sessions.length === 1) {
+        afterDelete = candidate
+        return true
+      }
+      return false
+    })
+    assert.equal(afterDelete.usage.sessions[0].sessionID, "ses-a")
+  } finally {
     cleanup()
   }
 })

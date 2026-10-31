@@ -139,6 +139,18 @@ const priceLimits = {
   },
 } as const
 
+/** One financial cost bucket of a session or of the totals row. */
+const usageCost = {
+  type: "object",
+  properties: {
+    amount: { type: "number" },
+    currency: { type: "string" },
+    basis: { type: "string", enum: ["account", "measured"] },
+  },
+  required: ["amount", "currency", "basis"],
+  additionalProperties: false,
+} as const
+
 const status = {
   type: "object",
   properties: {
@@ -245,6 +257,41 @@ const status = {
       },
     },
     modelsDiscovered: { type: "number" },
+    usage: {
+      type: "object",
+      properties: {
+        sessions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              sessionID: { type: "string" },
+              model: { type: "string" },
+              steps: { type: "number" },
+              tokens: {
+                type: "object",
+                properties: {
+                  input: { type: "number" },
+                  output: { type: "number" },
+                  reasoning: { type: "number" },
+                  cacheRead: { type: "number" },
+                  cacheWrite: { type: "number" },
+                },
+                required: ["input", "output", "reasoning", "cacheRead", "cacheWrite"],
+                additionalProperties: false,
+              },
+              costs: { type: "array", items: usageCost },
+              updatedAt: { type: "string" },
+            },
+            required: ["sessionID", "steps", "tokens", "costs", "updatedAt"],
+            additionalProperties: false,
+          },
+        },
+        totals: { type: "array", items: usageCost },
+      },
+      required: ["sessions", "totals"],
+      additionalProperties: false,
+    },
     models: { type: "array", items: model },
     groups: {
       type: "array",
@@ -281,6 +328,7 @@ const status = {
     "pinnedModels",
     "manualGroups",
     "modelsDiscovered",
+    "usage",
     "models",
     "groups",
   ],

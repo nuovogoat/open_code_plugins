@@ -291,6 +291,18 @@ export default Plugin.define({
           .map((unit) => ({ unit, value: cbrConvert(rates, amount, from, unit) }))
           .filter((item): item is { unit: string; value: number } => item.value !== undefined)
       }
+      const usageCostText = (
+        costs: ReadonlyArray<{ amount: number; currency: string; basis: "account" | "measured" }>,
+      ) =>
+        costs.length === 0
+          ? "—"
+          : costs
+              .map((cost) =>
+                `${formatBalance(cost.amount, cost.currency)}${
+                  cost.basis === "account" ? " по тарифу аккаунта" : " измерено OpenCode"
+                }`,
+              )
+              .join(" + ")
       const priceOrientation = (model: CatalogModel) => {
         const price = catalogPrice(model)
         return Number.isFinite(price) ? orientation(price, priceCurrency(model)) : []
@@ -781,6 +793,35 @@ export default Plugin.define({
                       ? `Пока переключатель включён, цены в разных валютах сравниваются в стратегии «cheapest» через пересчёт по курсу ЦБ РФ на ${status()!.cbr!.date}${status()!.cbr!.stale ? " (курсы устарели: обновить не удалось)" : ""}. Метод приблизительный: курс ЦБ — официальный, а не курс провайдера; провайдеры конвертируют средства по своим курсам, поэтому фактические расходы могут отличаться от оценки — пересчёт лишь упорядочивает кандидатов и не является котировкой. Значения «≈» приблизительны так же. Границы цены и пороги остатка пересчёту не подлежат и проверяются строго в валюте аккаунта/цены. Если курс какой-то валюты не загружен, разные валюты, как и прежде, численно не сравниваются.`
                       : "Курс ЦБ РФ ещё не загружен: ориентировка «≈» и приблизительное сравнение разных валют в ранжировании «cheapest» появятся после первого успешного запроса к публичному API ЦБ РФ."}
                   </p>
+                </Show>
+              </div>
+            </section>
+
+            <section class="mar-panel">
+              <div class="mar-panel-body">
+                <h3>Статистика использования</h3>
+                <p class="mar-help">Токены завершённых шагов сессий OpenCode; обновляется вместе со статусом (порядка 30 секунд). Стоимость — по подтверждённому тарифу аккаунта первого уровня в валюте аккаунта (токены рассуждения — по цене output; токены кэша — только если тариф объявляет цены кэша); без подтверждённого тарифа — стоимость, измеренная самим OpenCode, в USD; нет ни того ни другого — прочерк, значения не выдумываются. Разные валюты между собой не суммируются.</p>
+                <Show
+                  when={status()!.usage.sessions.length > 0}
+                  fallback={<div class="mar-panel mar-empty">Завершённых шагов пока нет: статистика появится после первого ответа модели.</div>}
+                >
+                  <div class="mar-account-list">
+                    <For each={status()!.usage.sessions}>{(item) => (
+                      <div class="mar-account">
+                        <span class="mar-account-name" title={item.sessionID}>{item.sessionID.slice(0, 16)}</span>
+                        <span class="mar-muted">{item.model ?? "—"}</span>
+                        <span class="mar-muted" title="Завершённые шаги">{item.steps} шаг.</span>
+                        <span class="mar-muted" title="Входные / выходные (включая рассуждения) токены и кэш (чтение/запись)">
+                          вход {item.tokens.input} · выход {item.tokens.output + item.tokens.reasoning} · кэш {item.tokens.cacheRead}/{item.tokens.cacheWrite}
+                        </span>
+                        <span class="mar-account-balance" title="Стоимость: тариф аккаунта либо измерение OpenCode">{usageCostText(item.costs)}</span>
+                      </div>
+                    )}</For>
+                    <div class="mar-account">
+                      <span class="mar-account-name">Итого</span>
+                      <span class="mar-account-balance" title="Сумма по всем сессиям в разрезе валют и оснований">{usageCostText(status()!.usage.totals)}</span>
+                    </div>
+                  </div>
                 </Show>
               </div>
             </section>

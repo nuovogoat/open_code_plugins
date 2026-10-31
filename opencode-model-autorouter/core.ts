@@ -123,9 +123,63 @@ export interface ModelMetrics {
   generatedTokens: number
 }
 
+export interface StepTokens {
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
+}
+
+/** Token counters of a finished step; unrecognized or negative values become zero — nothing is invented. */
+export function parseStepTokens(data: any): StepTokens {
+  const num = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0
+  const raw = data?.tokens
+  return {
+    input: num(raw?.input),
+    output: num(raw?.output),
+    reasoning: num(raw?.reasoning),
+    cacheRead: num(raw?.cache?.read),
+    cacheWrite: num(raw?.cache?.write),
+  }
+}
+
+/**
+ * Step cost at a confirmed account tariff (per million tokens, first tier).
+ * Reasoning tokens are billed at the output rate — they are generated tokens.
+ * Cache tokens are billed only when the tariff declares cache rates; undeclared
+ * rates are never guessed. Without a tariff the cost is undefined, and the
+ * caller falls back to the cost OpenCode measured itself.
+ */
+export function accountStepCost(tier: ModelCost | undefined, tokens: StepTokens): number | undefined {
+  if (!tier) return undefined
+  if (!Number.isFinite(tier.input) || tier.input < 0) return undefined
+  if (!Number.isFinite(tier.output) || tier.output < 0) return undefined
+  let amount = (tokens.input * tier.input + (tokens.output + tokens.reasoning) * tier.output) / 1_000_000
+  if (tier.cache && Number.isFinite(tier.cache.read) && tier.cache.read >= 0) {
+    amount += (tokens.cacheRead * tier.cache.read) / 1_000_000
+  }
+  if (tier.cache && Number.isFinite(tier.cache.write) && tier.cache.write >= 0) {
+    amount += (tokens.cacheWrite * tier.cache.write) / 1_000_000
+  }
+  return amount
+}
+
 export interface RouterEvent {
   type: string
   data?: any
+}
+
+/** Per-session token counters and financial costs accumulated from finished steps. */
+interface SessionUsage {
+  sessionID: string
+  model?: string
+  steps: number
+  tokens: StepTokens
+  /** Key `${basis}:${currency}` → amount; a step lands in exactly one bucket. */
+  costs: Map<string, number>
+  updatedAt: number
 }
 
 interface Registration {
@@ -695,6 +749,7 @@ export class ModelAutoRouter {
   private readonly ready: Promise<void>
   private configuring: Promise<void> = Promise.resolve()
   private readonly metrics = new Map<string, ModelMetrics>()
+  private readonly usage = new Map<string, SessionUsage>()
   private readonly cooldowns = new Map<string, number>()
   private readonly steps = new Map<string, { model: ModelRef; started: number }>()
   private readonly requests = new Map<string, number>()
@@ -1300,6 +1355,7 @@ export class ModelAutoRouter {
     const generated = Math.max(0, (data.tokens?.output ?? 0) + (data.tokens?.reasoning ?? 0))
     metrics.generatedTokens += generated
     metrics.totalCostUSD += Number.isFinite(data.cost) ? Math.max(0, data.cost) : 0
+    this.recordUsage(data, started.model)
     if (generated > 0) {
       metrics.outputTokensPerSecond = ema(
         metrics.outputTokensPerSecond,
@@ -1308,6 +1364,76 @@ export class ModelAutoRouter {
       )
     }
     this.cooldowns.delete(modelKey(started.model))
+  }
+
+  /**
+   * Real-time usage statistics: token counters per session plus the financial
+   * cost of the step. The cost basis is the confirmed account tariff of the
+   * step's model (account currency); without one, the cost OpenCode measured
+   * itself (USD); without either, the step adds no cost row — never invented.
+   */
+  private recordUsage(data: any, model: ModelRef): void {
+    const sessionID = data?.sessionID
+    if (typeof sessionID !== "string" || sessionID === "") return
+    const tokens = parseStepTokens(data)
+    let entry = this.usage.get(sessionID)
+    if (!entry) {
+      entry = {
+        sessionID,
+        steps: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        costs: new Map(),
+        updatedAt: 0,
+      }
+      this.usage.set(sessionID, entry)
+      if (this.usage.size > 500) this.usage.delete(this.usage.keys().next().value!)
+    }
+    entry.model = modelKey(model)
+    entry.steps += 1
+    entry.tokens.input += tokens.input
+    entry.tokens.output += tokens.output
+    entry.tokens.reasoning += tokens.reasoning
+    entry.tokens.cacheRead += tokens.cacheRead
+    entry.tokens.cacheWrite += tokens.cacheWrite
+    const priced = this.accounts.get(model.providerID)?.costs.get(model.id)
+    const accountCost = priced ? accountStepCost(priced.cost[0], tokens) : undefined
+    if (accountCost !== undefined && priced) {
+      const key = `account:${priced.currency}`
+      entry.costs.set(key, (entry.costs.get(key) ?? 0) + accountCost)
+    } else if (typeof data?.cost === "number" && Number.isFinite(data.cost) && data.cost >= 0) {
+      const key = "measured:USD"
+      entry.costs.set(key, (entry.costs.get(key) ?? 0) + data.cost)
+    }
+    entry.updatedAt = Date.now()
+  }
+
+  private usageStatus() {
+    const costRows = (costs: ReadonlyMap<string, number>) =>
+      [...costs.entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, amount]) => ({
+          amount,
+          currency: key.slice(key.indexOf(":") + 1),
+          basis: key.startsWith("account:") ? ("account" as const) : ("measured" as const),
+        }))
+    const totals = new Map<string, number>()
+    for (const entry of this.usage.values()) {
+      for (const [key, amount] of entry.costs) {
+        totals.set(key, (totals.get(key) ?? 0) + amount)
+      }
+    }
+    const sessions = [...this.usage.values()]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 200)
+      .map((entry) => ({
+        sessionID: entry.sessionID,
+        ...(entry.model === undefined ? {} : { model: entry.model }),
+        steps: entry.steps,
+        tokens: { ...entry.tokens },
+        costs: costRows(entry.costs),
+        updatedAt: new Date(entry.updatedAt).toISOString(),
+      }))
+    return { sessions, totals: costRows(totals) }
   }
 
   private canContinue(): boolean {
@@ -1397,11 +1523,17 @@ export class ModelAutoRouter {
         break
       case "session.execution.succeeded":
       case "session.execution.interrupted":
+        this.pending.delete(data?.sessionID)
+        this.attempts.delete(data?.sessionID)
+        this.failedExecutions.delete(data?.sessionID)
+        this.activity.delete(data?.sessionID)
+        break
       case "session.deleted":
         this.pending.delete(data?.sessionID)
         this.attempts.delete(data?.sessionID)
         this.failedExecutions.delete(data?.sessionID)
         this.activity.delete(data?.sessionID)
+        this.usage.delete(data?.sessionID)
         break
     }
   }
@@ -1527,6 +1659,7 @@ export class ModelAutoRouter {
         }),
       })),
       modelsDiscovered: this.models.length,
+      usage: this.usageStatus(),
       models: this.models.map((info) => {
         const ref = { providerID: info.providerID, id: info.id }
         const key = modelKey(ref)

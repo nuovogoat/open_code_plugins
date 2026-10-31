@@ -110,6 +110,31 @@ export interface AccountInfo {
   pluginKey?: boolean
 }
 
+/** Financial cost bucket of the usage statistics: account tariff or OpenCode-measured. */
+export interface UsageCost {
+  amount: number
+  currency: string
+  basis: "account" | "measured"
+}
+
+export interface UsageInfo {
+  sessions: Array<{
+    sessionID: string
+    model?: string
+    steps: number
+    tokens: {
+      input: number
+      output: number
+      reasoning: number
+      cacheRead: number
+      cacheWrite: number
+    }
+    costs: UsageCost[]
+    updatedAt: string
+  }>
+  totals: UsageCost[]
+}
+
 export interface RouterStatus {
   enabled: boolean
   autoDiscover: boolean
@@ -140,6 +165,7 @@ export interface RouterStatus {
   pinnedModels: Array<{ sessionID: string; model: string }>
   manualGroups: ManualGroup[]
   modelsDiscovered: number
+  usage: UsageInfo
   models: CatalogModel[]
   groups: Array<{
     name: string

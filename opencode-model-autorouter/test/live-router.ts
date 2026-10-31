@@ -192,6 +192,18 @@ try {
   assert.equal(accounts.get("teamorouter").balanceCurrency, "USD")
   assert.equal(accounts.get("plusvibe").balanceCurrency, "RUB")
   if (accounts.has("apimaster")) assert.equal(accounts.get("apimaster").state, "unsupported")
+  // Usage statistics are always present and well-shaped; every cost row carries
+  // an explicit currency and basis, amounts are finite and non-negative.
+  assert.ok(Array.isArray(status.usage.sessions) && Array.isArray(status.usage.totals))
+  for (const session of status.usage.sessions as any[]) {
+    assert.equal(typeof session.sessionID, "string")
+    assert.equal(typeof session.steps, "number")
+    for (const cost of session.costs as any[]) {
+      assert.ok(["account", "measured"].includes(cost.basis))
+      assert.equal(typeof cost.currency, "string")
+      assert.ok(Number.isFinite(cost.amount) && cost.amount >= 0)
+    }
+  }
   // Every displayed price comes from a confirmed source (account tariff or
   // public listing) and carries its currency.
   assert.ok(

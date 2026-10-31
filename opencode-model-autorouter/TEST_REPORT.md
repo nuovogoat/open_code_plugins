@@ -1,22 +1,22 @@
 # Отчёт о тестировании opencode-model-autorouter
 
 Дата последнего прогона: **2026-11-01**
-Версия: **0.10.1**
-Коммит: `d9519f2` + рабочее дерево v0.10.1 (`setAccountKey` отклоняет провайдеров без подтверждённого аккаунтного API)
+Версия: **0.11.0**
+Коммит: `d326199` + рабочее дерево v0.11.0 (секция GUI «Статистика использования»: токены завершённых шагов и финансовые затраты по тарифам аккаунтов)
 
 ## Сводка
 
 | Категория | Кол-во | Статус |
 | :--- | :--- | :--- |
-| Всего тестов | 97 | ✅ |
-| Пройдено (unit) | 88 | ✅ |
+| Всего тестов | 99 | ✅ |
+| Пройдено (unit) | 90 | ✅ |
 | Пройдено (GC) | 7 | ✅ |
 | Пропущено (без --expose-gc) | 2 | ℹ️ |
 | Ошибок | 0 | ✅ |
 | Утечек данных | 0 | ✅ |
 | Утечек памяти | 0 | ✅ |
 | Typecheck | clean | ✅ |
-| GUI bundle | 77.29 KB | ✅ |
+| GUI bundle | 83.03 KB | ✅ |
 | Время выполнения (unit) | ~1.9 с | ⚡ |
 | Время выполнения (GC) | ~0.6 с | ⚡ |
 
@@ -24,18 +24,20 @@
 
 ## Результаты жёсткого прогона (2026-11-01)
 
-### Unit-тесты (90 тестов, 88 pass, 2 skipped)
+### Unit-тесты (92 теста, 90 pass, 2 skipped)
 ```
 ✔ manual choice: router asks before overriding and keep pins the manual model
 ✔ manual choice: confirming the override switches and marks the model router-owned
 ✔ manual choice: askBeforeOverride=false keeps fully automatic silent routing
+✔ usage: step tokens are parsed defensively and priced only by declared tariff rates
+✔ usage: finished steps accumulate tokens and cost by account tariff or measured USD
 ✔ vault: keys roundtrip through storage encrypted and are trimmed
 ✔ vault: account keys never leak into RPC responses, logs or public pricing
 ✔ vault: RPC schema has no hardcoded provider enum (dynamic allowlist)
 ✔ version: manifest, changelog and pinned installation docs stay in sync
 ✔ name: every identifier uses the canonical product spelling
-... (82 дополнительных теста router/failover/pricing/config/guardrails/cbr)
-ℹ tests 90 | pass 88 | fail 0 | skipped 2
+... (84 дополнительных теста router/failover/pricing/config/guardrails/cbr)
+ℹ tests 99 | pass 97 | fail 0 | skipped 2
 ```
 
 ### GC-тесты (7 тестов, 7 pass)
@@ -51,12 +53,18 @@
 ```
 
 ### Память
-- **3000 циклов setup/cleanup:** удержано **≈0 KB** (дельта отрицательная, порог <16 MB)
-- **500 циклов discovery:** удержано **430 KB** (порог <16 MB)
+- **3000 циклов setup/cleanup:** удержано **≈199 KB** (порог <16 MB)
+- **500 циклов discovery:** удержано **≈427 KB** (порог <16 MB)
 - Подписки: 3200 закрыто, 16000 dispose вызвано, 0 активных утечек
 - Пер-сессионные карты защиты ручного выбора (`routerOwned`, `pinnedManual`, `overrideRequests`) ограничены 500 записями с FIFO-выбыванием
+- Карта статистики использования (`usage`) ограничена 500 сессиями с FIFO-выбыванием и очищается при `session.deleted`
 
 ## Категории тестов
+
+### 📊 Статистика использования (новое в 0.11.0)
+-   **usage: step tokens are parsed defensively and priced only by declared tariff rates** — защитный разбор `tokens` шага: мусор, отрицательные и нечисловые значения становятся нулём; тарификация `accountStepCost` только объявленными ценами тарифа первого уровня (рассуждения — по цене output; кэш — только при объявленных ценах кэша); сломанный тариф (NaN, отрицательная цена) и отсутствие тарифа дают `undefined` — стоимость не выдумывается.
+-   **usage: finished steps accumulate tokens and cost by account tariff or measured USD** — класс-уровневый тест: шаги сессии накапливаются в `status().usage` (токены, число шагов, последняя модель); провайдер с подтверждённым рублёвым тарифом получает строку `basis: "account"` в RUB, провайдер без тарифа — фолбэк `basis: "measured"` в USD по `data.cost` OpenCode; итоги (`totals`) не смешивают валюты и основания; `session.deleted` очищает статистику сессии.
+-   **live-router.ts** — жёсткий прогон на реальном CLI дополнительно проверяет форму `usage`: каждая строка стоимости несёт явные `currency` и `basis` (`account`/`measured`), суммы конечны и неотрицательны.
 
 ### 🛡️ Защита ручного выбора модели (новое в 0.8.0)
 -   **manual choice: router asks before overriding and keep pins the manual model** — prompt с выставленной вручную моделью не переключается молча: регистрируется запрос, отправляется ровно одно synthetic-уведомление (`kind: "override-request"`, без `resume`); повторный prompt не спамит; `resolveOverrideRequest(keep)` закрепляет модель (`pinnedModels` в статусе); после `releaseManualSelection` роутер спрашивает снова.
@@ -98,7 +106,7 @@
 ## Как запустить
 
 ```powershell
-# Обычные тесты (90 тестов)
+# Обычные тесты (99 тестов)
 & "C:\Runners\Runner-asr_local\externals\node24\bin\node.exe" --test "test/*.test.ts"
 
 # GC-тесты (7 тестов, требуют флага)
@@ -117,6 +125,7 @@ $env:OPENCODE_CLI = "C:\Users\Honor\AppData\Local\Programs\ai.opencode.desktop\r
 
 ## История изменений
 
+-   **2026-11-01:** v0.11.0 — секция GUI «Статистика использования»: токены завершённых шагов сессий OpenCode (входные, выходные включая рассуждения, кэш чтение/запись) и финансовые затраты в реальном времени по каждой сессии и итого. Основание стоимости — подтверждённый тариф аккаунта первого уровня в валюте аккаунта; без него — стоимость, измеренная самим OpenCode, в USD; нет ни того ни другого — прочерк (значения не выдумываются). Разные валюты и основания не суммируются: итоги в разрезе `basis:currency`. Накопление серверной частью из `session.step.ended`, карта ограничена 500 сессиями (FIFO), очистка при `session.deleted`; RPC `status` возвращает поле `usage` (строгая схема), GUI обновляет секцию вместе со статусом (порядка 30 секунд). 2 новых герметичных теста (unit-тарификация + класс-уровневое накопление/очистка) и проверка формы `usage` в live-прогоне: 99 тестов, 97 pass, 0 fail, 2 skip (GC-гейт); полный GC-прогон 99/99, retained ≈199 KB после 3000 циклов и ≈427 KB после 500 циклов. Жёсткий live-прогон реальным CLI зелёный (exit 0, 582 модели, teamorouter live $9.84, plusvibe live ₽303.56, apimaster unsupported, ЦБ USD 80.5573 на 31.10.2026). Typecheck clean, GUI bundle 83.03 KB.
 -   **2026-11-01:** v0.10.1 — RPC `setAccountKey` отклоняет провайдеров без подтверждённого аккаунтного API (ключ без потребителя — мёртвая настройка): проверка `accountCapable` из `pricing.ts` (единый источник истины с GUI) выполняется до записи в сейф. Дефект найден жёстким live-прогоном реальным CLI, который не входит в герметичную сюиту. 1 новый герметичный тест (отклонение + отсутствие записи + успех для способного провайдера): 95 тестов, 93 pass, 0 fail, 2 skip (GC-гейт); полный GC-прогон всей сюиты 95/95, retained ≈0 (−5 KB шума) после 3000 циклов и 439 KB после 500 циклов robustness; live-прогон зелёный (apimaster → `unsupported`, отклонение подтверждено). Typecheck clean, GUI не менялся (бандл 79.16 KB).
 -   **2026-11-01:** v0.10.0 — явно включённая ориентировка по курсу ЦБ РФ участвует в ранжировании `cheapest`: смешанные валюты приближённо пересчитываются в рубли и сравниваются численно (помечено в GUI и документах как неточная оценка: провайдеры конвертируют по своим курсам); без курса хотя бы одной валюты — прежнее нечисленное сравнение; границы цены и пороги остатка пересчёту не подлежат. 2 новых теста (unit-ранжирование с ЦБ, класс-уровневое автопереключение при включении/выключении ориентировки): 94 теста, 92 pass, 0 fail, 2 skip (GC-гейт); GC-прогон 7/7. Typecheck clean, GUI bundle 79.16 KB (обновлены пометки о неточности метода).
 -   **2026-11-01:** v0.9.0 — публичные цены без входа распознают формат шлюзов new-api/one-api (`/api/pricing`, конверсия `model_ratio × 2` = USD за 1M по конвенции 500000 quota = $1; проверено эмпирически на apimaster.ai: gpt-6-astra ratio 5 → $10/$50, совпадает с публичным сайтом). 2 новых теста (парсер new-api, сценарий загрузчика): 92 теста, 90 pass, 0 fail, 2 skip (GC-гейт); GC-прогон 7/7. Typecheck clean, GUI не менялся. Аккаунтный баланс apimaster не реализован: `subscription` возвращает фиктивную заглушку $100M, `/api/user/self` требует сессионный токен консоли — выдумывать цифры запрещено стандартом.
