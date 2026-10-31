@@ -227,6 +227,14 @@ function fakeContext(models: ModelInfo[], options: Record<string, unknown> = {})
         return { data: models }
       },
     },
+    provider: {
+      async list() {
+        // Derive provider roster from models so the dynamic vault allowlist
+        // always includes providers that have active models.
+        const ids = [...new Set(models.map((m) => m.providerID))]
+        return { data: ids.map((id) => ({ id })) }
+      },
+    },
     pricing: {
       async load() {
         return []
@@ -400,9 +408,6 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
   const ctx = fakeContext([model("teamorouter", "same", 8)])
   // Force the production account path: no pricing override and no OpenCode integration.
   delete ctx.pricing
-  // provider.list() must return the same models so the dynamic roster includes
-  // teamorouter (replaces the old hardcoded allowlist).
-  ctx.provider = { async list() { return { data: [{ id: "teamorouter" }] } } }
   const requests: Array<{ url: string; init?: RequestInit }> = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
