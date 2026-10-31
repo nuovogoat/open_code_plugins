@@ -315,8 +315,10 @@ export const ModelAutoRouterRpc = Rpc.define({
       input: {
         type: "object",
         properties: {
-          // Providers with a confirmed account API; the key only travels to their hardcoded origin.
-          providerID: { type: "string", enum: ["openrouter", "teamorouter", "plusvibe"] },
+          // Dynamic: any provider currently visible to the router. Validation
+          // happens in core.ts against the live model/credentials roster;
+          // the schema only enforces shape here.
+          providerID: { type: "string", minLength: 1, maxLength: 128 },
           key: { type: "string", minLength: 1, maxLength: 512 },
         },
         required: ["providerID", "key"],

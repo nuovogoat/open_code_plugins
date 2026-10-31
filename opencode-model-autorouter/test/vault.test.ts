@@ -1,8 +1,7 @@
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import test from "node:test"
-import { openAccountVault, VAULT_PROVIDERS, type VaultStorage } from "../vault.ts"
-import { VAULT_PROVIDER_IDS } from "../src/catalog.ts"
+import { openAccountVault, type VaultStorage } from "../vault.ts"
 
 function memoryStorage(): VaultStorage & { values: Map<string, unknown> } {
   const values = new Map<string, unknown>()
@@ -24,7 +23,7 @@ test("vault: keys roundtrip through storage encrypted and are trimmed", async ()
   const storage = memoryStorage()
   const vault = (await openAccountVault(storage))!
   assert.ok(vault)
-  await vault.set("plusvibe", "  pv-secret-key  ")
+  await vault.set("plusvibe", "  pv-secret-key  ", ["plusvibe"])
   assert.equal(await vault.get("plusvibe"), "pv-secret-key")
   // The plaintext key never appears in any persisted record.
   for (const value of storage.values.values()) {
@@ -40,7 +39,7 @@ test("vault: keys roundtrip through storage encrypted and are trimmed", async ()
 test("vault: a reopened instance decrypts the stored key via the persisted salt", async () => {
   const storage = memoryStorage()
   const first = await openAccountVault(storage)
-  await first!.set("teamorouter", "teamo-key")
+  await first!.set("teamorouter", "teamo-key", ["teamorouter"])
   const second = await openAccountVault(storage)
   assert.equal(await second!.get("teamorouter"), "teamo-key")
   assert.deepEqual(await second!.providers(), ["teamorouter"])
@@ -49,7 +48,7 @@ test("vault: a reopened instance decrypts the stored key via the persisted salt"
 test("vault: tampered or malformed records resolve as absent instead of throwing", async () => {
   const storage = memoryStorage()
   const vault = (await openAccountVault(storage))!
-  await vault.set("openrouter", "or-key")
+  await vault.set("openrouter", "or-key", ["openrouter"])
   const entry = storage.values.get("account-vault-v1:openrouter") as Record<string, unknown>
   entry.data = Buffer.from("tampered-ciphertext").toString("base64")
   assert.equal(await vault.get("openrouter"), undefined)
@@ -62,8 +61,8 @@ test("vault: tampered or malformed records resolve as absent instead of throwing
 test("vault: clear removes the key and the provider list, reporting repeats", async () => {
   const storage = memoryStorage()
   const vault = (await openAccountVault(storage))!
-  await vault.set("plusvibe", "pv-key")
-  await vault.set("openrouter", "or-key")
+  await vault.set("plusvibe", "pv-key", ["plusvibe", "openrouter"])
+  await vault.set("openrouter", "or-key", ["plusvibe", "openrouter"])
   assert.deepEqual(await vault.providers(), ["plusvibe", "openrouter"])
   assert.equal(await vault.clear("plusvibe"), true)
   assert.equal(await vault.get("plusvibe"), undefined)
@@ -73,18 +72,23 @@ test("vault: clear removes the key and the provider list, reporting repeats", as
   assert.equal(await vault.get("openrouter"), "or-key")
 })
 
-test("vault: only providers with a confirmed account API may store keys", async () => {
+test("vault: rejects keys for providers not in the current known roster", async () => {
   const vault = (await openAccountVault(memoryStorage()))!
-  await assert.rejects(vault.set("apimaster", "key"), /only accepted for/u)
-  await assert.rejects(vault.set("", "key"), /only accepted for/u)
+  // Empty roster → nothing is accepted.
+  await assert.rejects(vault.set("apimaster", "key", []), /not currently known/u)
+  // Roster with other providers → target still rejected.
+  await assert.rejects(vault.set("apimaster", "key", ["openrouter"]), /not currently known/u)
+  // Empty string ID is never in the roster.
+  await assert.rejects(vault.set("", "key", ["openrouter"]), /not currently known/u)
   assert.deepEqual(await vault.providers(), [])
 })
 
 test("vault: empty, blank and oversized keys are rejected", async () => {
   const vault = (await openAccountVault(memoryStorage()))!
-  await assert.rejects(vault.set("plusvibe", ""), /non-empty string/u)
-  await assert.rejects(vault.set("plusvibe", "   "), /non-empty string/u)
-  await assert.rejects(vault.set("plusvibe", "k".repeat(513)), /non-empty string/u)
+  const known = ["plusvibe"]
+  await assert.rejects(vault.set("plusvibe", "", known), /non-empty string/u)
+  await assert.rejects(vault.set("plusvibe", "   ", known), /non-empty string/u)
+  await assert.rejects(vault.set("plusvibe", "k".repeat(513), known), /non-empty string/u)
   assert.deepEqual(await vault.providers(), [])
 })
 
@@ -104,9 +108,10 @@ test("vault: account keys never leak into RPC responses, logs or public pricing"
   ]
   const storage = memoryStorage()
   const vault = (await openAccountVault(storage))!
-  await vault.set("openrouter", secrets[0])
-  await vault.set("teamorouter", secrets[1])
-  await vault.set("plusvibe", secrets[2])
+  const knownIDs = ["openrouter", "teamorouter", "plusvibe"]
+  await vault.set("openrouter", secrets[0], knownIDs)
+  await vault.set("teamorouter", secrets[1], knownIDs)
+  await vault.set("plusvibe", secrets[2], knownIDs)
 
   // Capture everything that would leave the plugin boundary.
   const logged: string[] = []
@@ -191,13 +196,16 @@ test("vault: account keys never leak into RPC responses, logs or public pricing"
   }
 })
 
-test("vault: provider lists stay in sync across vault, RPC schema and GUI catalog", async () => {
-  // rpc.ts is parsed as source because unit tests run hermetically in CI
-  // without installing @opencode/plugin; a missing enum fails this test loudly.
+test("vault: RPC schema has no hardcoded provider enum (dynamic allowlist)", async () => {
+  // Ensures no regression to a static enum. The vault now validates against
+  // the live model/vault roster, so the schema must accept any string.
   const source = await readFile(new URL("../rpc.ts", import.meta.url), "utf8")
-  const match = source.match(/providerID:\s*\{\s*type:\s*"string",\s*enum:\s*\[([^\]]*)\]/u)
-  assert.ok(match, "rpc.ts setAccountKey providerID enum was not found")
-  const rpcEnum = match[1].split(",").map((item) => item.trim().replace(/^"|"$/gu, ""))
-  assert.deepEqual(rpcEnum, [...VAULT_PROVIDERS])
-  assert.deepEqual([...VAULT_PROVIDER_IDS], [...VAULT_PROVIDERS])
+  // Match across lines: providerID value spans multiple lines (comment + properties).
+  const providerIDMatch = source.match(/setAccountKey:[\s\S]*?providerID:\s*\{([\s\S]*?)\},\s*key:/u)
+  assert.ok(providerIDMatch, "providerID property was not found in setAccountKey input")
+  assert.equal(
+    providerIDMatch[1].includes("enum"),
+    false,
+    "setAccountKey providerID must NOT have a static enum; validation is dynamic",
+  )
 })

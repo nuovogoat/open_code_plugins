@@ -14,7 +14,7 @@ import {
   type PriceState,
   type PublicSnapshot,
 } from "./pricing.ts"
-import { openAccountVault, VAULT_PROVIDERS, type AccountVault } from "./vault.ts"
+import { openAccountVault, type AccountVault } from "./vault.ts"
 
 export type Strategy = "free-fastest" | "fastest" | "cheapest" | "manual"
 
@@ -667,6 +667,8 @@ export class ModelAutoRouter {
   private autoSites = new Map<string, string>()
   private vault: AccountVault | undefined
   private vaultProviders = new Set<string>()
+  /** Live snapshot of provider IDs visible to the router (models + vault). */
+  private knownProviderIDs: string[] = []
   private refreshing: Promise<void> | undefined
   private stopped = false
   private timer: ReturnType<typeof setInterval> | undefined
@@ -833,12 +835,17 @@ export class ModelAutoRouter {
       const vaultIDs = (await this.vault?.providers()) ?? []
       if (this.stopped) return
       this.vaultProviders = new Set(vaultIDs)
+      // Snapshot of all provider IDs currently visible to the router.
+      // Used by vault.set to reject typos/injection without a hardcoded allowlist.
+      this.knownProviderIDs = [
+        ...new Set([...listed.data.map((p) => p.id), ...vaultIDs]),
+      ]
       const snapshots = await loadAccountSnapshots(
         globalThis.fetch,
         this.lifecycle.signal,
-        // Providers with a confirmed account API always surface, so the optional
-        // vault key can be set even without an OpenCode connection.
-        [...listed.data, ...VAULT_PROVIDERS.map((id) => ({ id })), ...vaultIDs.map((id) => ({ id }))],
+        // Dynamic roster: models + vault keys. No hardcoded provider list;
+        // any provider visible to the router can receive a vault key.
+        [...listed.data, ...vaultIDs.map((id) => ({ id }))],
         (provider) => this.resolveAccountKey(provider),
         this.accounts,
       )
@@ -1467,7 +1474,12 @@ export class ModelAutoRouter {
             if (this.stopped) throw new Error("router is unavailable")
             if (!this.vault) throw new Error("plugin storage is unavailable")
             // The key is encrypted at rest and never echoed back or logged.
-            await this.vault.set(input.providerID, input.key)
+            // Dynamic validation: build a fresh roster from models + vault so
+            // the call works even before the first refresh() completes.
+            const listed = this.ctx.provider ? await this.ctx.provider.list() : { data: [] as Array<{ id: string }> }
+            const vaultIDs = (await this.vault.providers()) ?? []
+            const roster = [...new Set([...listed.data.map((p) => p.id), ...vaultIDs])]
+            await this.vault.set(input.providerID, input.key, roster)
             this.vaultProviders.add(input.providerID)
             await this.refresh()
             return { stored: true, providerID: input.providerID }

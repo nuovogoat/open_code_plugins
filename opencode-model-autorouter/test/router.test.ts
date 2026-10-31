@@ -400,7 +400,9 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
   const ctx = fakeContext([model("teamorouter", "same", 8)])
   // Force the production account path: no pricing override and no OpenCode integration.
   delete ctx.pricing
-  ctx.provider = { async list() { return { data: [] } } }
+  // provider.list() must return the same models so the dynamic roster includes
+  // teamorouter (replaces the old hardcoded allowlist).
+  ctx.provider = { async list() { return { data: [{ id: "teamorouter" }] } } }
   const requests: Array<{ url: string; init?: RequestInit }> = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
@@ -416,7 +418,10 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
   const cleanup = setupModelAutoRouter(ctx, {})
   try {
     await eventually(() => ctx.rpcHandlers.setAccountKey !== undefined)
-    const stored = await ctx.rpcHandlers.setAccountKey({ providerID: "teamorouter", key: "vault-secret-key" })
+    const stored = await ctx.rpcHandlers.setAccountKey({
+      providerID: "teamorouter",
+      key: "vault-secret-key",
+    })
     assert.deepEqual(stored, { stored: true, providerID: "teamorouter" })
 
     const status = (await ctx.rpcHandlers.status({})) as any

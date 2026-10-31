@@ -20,8 +20,16 @@ export interface VaultStorage {
   remove(key: string): Promise<void>
 }
 
-/** Only providers with a confirmed account API may receive vault keys; a key never travels to any other origin. */
-export const VAULT_PROVIDERS: readonly string[] = ["openrouter", "teamorouter", "plusvibe"]
+/**
+ * Dynamic provider allowlist: the vault accepts keys only for providers that
+ * are currently visible to the router (via model.list or credentials.list).
+ * This replaces the hardcoded whitelist and prevents key storage for typos,
+ * removed providers or injected IDs, while still supporting any new provider
+ * without code changes.
+ *
+ * The caller (core.ts) passes the current snapshot of known provider IDs on
+ * every `set` call; the vault itself stays stateless about the roster.
+ */
 
 const SECRET_STORAGE_KEY = "account-vault-secret-v1"
 const ENTRY_PREFIX = "account-vault-v1:"
@@ -59,8 +67,12 @@ function record(value: unknown): Record<string, unknown> | undefined {
 }
 
 export interface AccountVault {
-  /** Stores an encrypted key; rejects providers without a confirmed account API. */
-  set(providerID: string, key: string): Promise<void>
+  /**
+   * Stores an encrypted key for a provider that is currently known to the router.
+   * `knownProviderIDs` is the live snapshot from core.ts (model.list + credentials);
+   * the vault rejects any ID not present in this list to prevent typos/injection.
+   */
+  set(providerID: string, key: string, knownProviderIDs: readonly string[]): Promise<void>
   /** Decrypts the stored key; tampered or malformed records resolve as absent. */
   get(providerID: string): Promise<string | undefined>
   clear(providerID: string): Promise<boolean>
@@ -84,9 +96,9 @@ export async function openAccountVault(storage: VaultStorage | undefined): Promi
     : randomBytes(32).toString("hex")
   const secret = deriveKey(salt)
   return {
-    async set(providerID, key) {
-      if (!VAULT_PROVIDERS.includes(providerID)) {
-        throw new Error(`account keys are only accepted for: ${VAULT_PROVIDERS.join(", ")}`)
+    async set(providerID, key, knownProviderIDs) {
+      if (!knownProviderIDs.includes(providerID)) {
+        throw new Error(`account key rejected: provider "${providerID}" is not currently known to the router`)
       }
       if (typeof key !== "string" || !key.trim() || key.length > 512) {
         throw new Error("account key must be a non-empty string of at most 512 characters")
@@ -115,7 +127,9 @@ export async function openAccountVault(storage: VaultStorage | undefined): Promi
   async function recordProviders(): Promise<string[]> {
     const stored = record(await store.get(SECRET_STORAGE_KEY)) as SecretRecord | undefined
     if (!Array.isArray(stored?.providers)) return []
-    return stored.providers.filter((id): id is string => VAULT_PROVIDERS.includes(id))
+    // Returns all stored IDs; staleness is handled by core.ts (keys for removed
+    // providers simply never match any model and are ignored).
+    return stored.providers.filter((id): id is string => typeof id === "string" && id.length > 0)
   }
 
   /** Always persists the exact salt the in-memory secret was derived from. */

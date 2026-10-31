@@ -83,12 +83,18 @@ export interface PublicPricingInfo {
 }
 
 /**
- * Providers whose account key can be stored in the plugin vault. Mirrors
- * `VAULT_PROVIDERS` in vault.ts and the RPC enum in rpc.ts (kept in sync by
- * test/vault.test.ts); vault.ts cannot be imported here because node:crypto
- * must never reach the GUI bundle.
+ * Display metadata for well-known account providers. Used by the GUI to render
+ * account cards, balance formatting and key-source labels.
+ *
+ * This is NOT an allowlist: the vault and RPC accept any provider ID that is
+ * currently visible to the router (models + vault). Providers not listed here
+ * still work; they just get default display formatting.
  */
-export const VAULT_PROVIDER_IDS: readonly string[] = ["openrouter", "teamorouter", "plusvibe"]
+export const KNOWN_ACCOUNT_PROVIDERS: Record<string, { name: string; currency: string; balanceDecimals: number }> = {
+  openrouter: { name: "OpenRouter", currency: "USD", balanceDecimals: 4 },
+  teamorouter: { name: "TeamoRouter", currency: "USD", balanceDecimals: 2 },
+  plusvibe: { name: "PlusVibe", currency: "RUB", balanceDecimals: 2 },
+}
 
 export interface AccountInfo {
   providerID: string

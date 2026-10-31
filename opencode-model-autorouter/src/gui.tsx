@@ -2,7 +2,7 @@ import { Command, Plugin, SettingsPage, Style, createLatest } from "@opencode/pl
 import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
 import { ModelAutoRouterRpc } from "../rpc.ts"
 import {
-  VAULT_PROVIDER_IDS,
+  KNOWN_ACCOUNT_PROVIDERS,
   accountCurrencies,
   catalogPrice,
   cbrConvert,
@@ -691,7 +691,7 @@ export default Plugin.define({
                           ≈ {orientation(account.balance, account.balanceCurrency).map((item) => formatBalance(item.value, item.unit)).join(" · ")}
                         </span>
                       </Show>
-                      <Show when={account.state !== "unsupported" || VAULT_PROVIDER_IDS.includes(account.providerID)}>
+                      <Show when={account.state !== "unsupported" || account.providerID in KNOWN_ACCOUNT_PROVIDERS}>
                         <div class="mar-account-actions">
                           <Show when={account.state !== "unsupported"}>
                             <ctx.ui.Button
@@ -703,18 +703,16 @@ export default Plugin.define({
                               {status()?.accountThresholds?.[account.providerID] ? "Изменить пороги" : "Пороги"}
                             </ctx.ui.Button>
                           </Show>
-                          <Show when={VAULT_PROVIDER_IDS.includes(account.providerID)}>
-                            <ctx.ui.Button
-                              size="small"
-                              variant="ghost"
-                              disabled={saving()}
-                              onClick={() => { setKeyProvider(account.providerID); setKeyDraft("") }}
-                            >
-                              {account.pluginKey ? "Заменить ключ" : "Задать ключ"}
-                            </ctx.ui.Button>
-                            <Show when={account.pluginKey}>
-                              <ctx.ui.Button size="small" variant="danger" disabled={saving()} onClick={() => void clearAccountKey(account.providerID)}>Удалить ключ</ctx.ui.Button>
-                            </Show>
+                          <ctx.ui.Button
+                            size="small"
+                            variant="ghost"
+                            disabled={saving()}
+                            onClick={() => { setKeyProvider(account.providerID); setKeyDraft("") }}
+                          >
+                            {account.pluginKey ? "Заменить ключ" : "Аккаунтные цены и баланс"}
+                          </ctx.ui.Button>
+                          <Show when={account.pluginKey}>
+                            <ctx.ui.Button size="small" variant="danger" disabled={saving()} onClick={() => void clearAccountKey(account.providerID)}>Удалить ключ</ctx.ui.Button>
                           </Show>
                         </div>
                       </Show>
@@ -807,14 +805,14 @@ export default Plugin.define({
                     >
                       {siteDraft(providerID).trim() === "" && status()?.providerSites?.[providerID] ? "Удалить адрес" : "Сохранить адрес"}
                     </ctx.ui.Button>
-                    <Show when={VAULT_PROVIDER_IDS.includes(providerID) && !status()?.accounts.find((account) => account.providerID === providerID)?.pluginKey}>
+                    <Show when={!status()?.accounts.find((account) => account.providerID === providerID)?.pluginKey}>
                       <ctx.ui.Button
                         size="small"
                         variant="ghost"
                         disabled={saving()}
                         onClick={() => { setKeyProvider(providerID); setKeyDraft("") }}
                       >
-                        Войти для точных расходов
+                        Аккаунтные цены и баланс
                       </ctx.ui.Button>
                     </Show>
                   </div>
