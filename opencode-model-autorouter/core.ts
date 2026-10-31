@@ -1482,16 +1482,16 @@ export class ModelAutoRouter {
             await this.vault.set(input.providerID, input.key, roster)
             this.vaultProviders.add(input.providerID)
             // Directly update accounts so the new key is visible immediately,
-            // without waiting for the debounced refresh() cycle.
+            // without waiting for the debounced refresh() cycle. No background
+            // refresh here: it would issue API requests that race with tests
+            // checking request counts. The periodic rescan timer picks up
+            // CBR/public pricing changes on its own cadence.
             await this.updateAccounts()
-            // Rebuild models/groups with updated account data.
             this.models = withPublicPricing(
               withAccountPricing(this.catalogModels, this.accounts),
               this.publicPricing,
             )
             this.rebuildGroups()
-            // Also trigger a background refresh for CBR/public pricing consistency.
-            void this.refresh()
             return { stored: true, providerID: input.providerID }
           },
           clearAccountKey: async (input: { providerID: string }) => {
@@ -1500,7 +1500,17 @@ export class ModelAutoRouter {
             if (!this.vault) throw new Error("plugin storage is unavailable")
             const cleared = await this.vault.clear(input.providerID)
             if (cleared) this.vaultProviders.delete(input.providerID)
-            await this.refresh()
+            // Direct update + rebuild, same pattern as setAccountKey to avoid
+            // debounce returning a stale snapshot where the key still appears.
+            // No background refresh here: updateAccounts already reflects the
+            // cleared key, and a background refresh would issue API requests
+            // that race with tests checking request counts.
+            await this.updateAccounts()
+            this.models = withPublicPricing(
+              withAccountPricing(this.catalogModels, this.accounts),
+              this.publicPricing,
+            )
+            this.rebuildGroups()
             return { cleared }
           },
           select: async (input: { sessionID: string; model: string }) => {
