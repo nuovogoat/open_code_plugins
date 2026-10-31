@@ -116,6 +116,7 @@ export interface RouterStatus {
   strategy: Strategy
   defaultGroup?: string
   resumeAfterFailover: boolean
+  askBeforeOverride: boolean
   cooldownMs: number
   metricAlpha: number
   rescanIntervalMs: number
@@ -127,6 +128,16 @@ export interface RouterStatus {
   publicPricing: PublicPricingInfo[]
   accounts: AccountInfo[]
   disabledModels: string[]
+  /** Pending "keep or override" questions for manually chosen models. */
+  overrideRequests: Array<{
+    sessionID: string
+    current: string
+    proposed: string
+    group: string
+    askedAt: string
+  }>
+  /** Sessions pinned to a manually chosen model. */
+  pinnedModels: Array<{ sessionID: string; model: string }>
   manualGroups: ManualGroup[]
   modelsDiscovered: number
   models: CatalogModel[]

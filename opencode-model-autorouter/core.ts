@@ -77,6 +77,13 @@ export interface RouterOptions {
   disabledModels?: string[]
   cooldownMs?: number
   resumeAfterFailover?: boolean
+  /**
+   * When a prompt arrives for a session whose current model was NOT set by the
+   * router (explicit user/config choice), the router asks before overriding:
+   * it registers an override request (GUI + one synthetic notice) instead of
+   * switching silently. Default true; set false for fully automatic routing.
+   */
+  askBeforeOverride?: boolean
   metricAlpha?: number
   rescanIntervalMs?: number
   accountThresholds?: Record<string, AccountThreshold>
@@ -248,7 +255,7 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
   /** Record keys come from user input; "__proto__" must never become a key. */
   const safeKey = (key: string) => key.trim().slice(0, 80)
   const usable = (key: string) => key !== "" && key !== "__proto__"
-  for (const key of ["enabled", "autoDiscover", "resumeAfterFailover", "cbrOrientation"] as const) {
+  for (const key of ["enabled", "autoDiscover", "resumeAfterFailover", "cbrOrientation", "askBeforeOverride"] as const) {
     if (typeof input[key] === "boolean") result[key] = input[key]
   }
   if (STRATEGIES.has(input.strategy as Strategy)) result.strategy = input.strategy as Strategy
@@ -634,6 +641,23 @@ export function selectCandidate(
   return [...candidates].sort(compareSpeed)[0]
 }
 
+/**
+ * A pending "keep or override" question for one session: the router wants to
+ * switch a manually chosen model but must not do it silently.
+ */
+export interface OverrideRequest {
+  sessionID: string
+  /** Model key ("providerID/id") the user chose by hand. */
+  current: string
+  /** Model key the router proposes instead. */
+  proposed: string
+  /** Full reference of the proposed candidate, resolved at switch time. */
+  proposedRef: ModelRef
+  group: string
+  /** Epoch ms when the question was first asked for this current/proposed pair. */
+  askedAt: number
+}
+
 export class ModelAutoRouter {
   readonly options: RouterOptions
   private readonly configuredOptions: RouterOptions
@@ -648,6 +672,12 @@ export class ModelAutoRouter {
   private readonly failovers = new Map<string, Promise<boolean>>()
   private readonly activity = new Map<string, number>()
   private readonly failedExecutions = new Set<string>()
+  /** Model keys last set by the router itself, per session (ownership marks). */
+  private readonly routerOwned = new Map<string, string>()
+  /** Sessions where the user answered "keep my manual model"; value = model key. */
+  private readonly pinnedManual = new Map<string, string>()
+  /** Unresolved override questions, at most one per session. */
+  private readonly overrideRequests = new Map<string, OverrideRequest>()
   private activityCounter = 0
   private readonly registrations: Registration[] = []
   private groups = new Map<string, RouteGroup>()
@@ -736,6 +766,8 @@ export class ModelAutoRouter {
       if (this.stopped) throw new Error("router is unavailable")
       this.replaceOptions(next)
       if (next.enabled === false || next.resumeAfterFailover === false) this.pending.clear()
+      // Turning the protection off invalidates pending keep-or-override questions.
+      if (next.askBeforeOverride === false) this.overrideRequests.clear()
       this.models = withPublicPricing(
         withAccountPricing(this.catalogModels, this.accounts),
         this.publicPricing,
@@ -770,6 +802,11 @@ export class ModelAutoRouter {
     const token = ++this.activityCounter
     this.activity.set(sessionID, token)
     return token
+  }
+
+  /** FIFO-bounds per-session maps so abandoned sessions cannot grow memory. */
+  private capSessions<V>(map: Map<string, V>): void {
+    while (map.size > 500) map.delete(map.keys().next().value!)
   }
 
   private groupFor(ref: ModelRef | undefined): RouteGroup | undefined {
@@ -998,6 +1035,11 @@ export class ModelAutoRouter {
           variant: candidate.variant,
         },
       })
+      // Mark the model as router-owned so the next prompt is not treated as a
+      // manual choice, and drop any stale keep-pin for this session.
+      this.routerOwned.set(sessionID, modelKey(candidate))
+      this.pinnedManual.delete(sessionID)
+      this.capSessions(this.routerOwned)
       return !this.stopped
     } catch {
       if (!this.stopped) this.report("model switch failed")
@@ -1018,6 +1060,9 @@ export class ModelAutoRouter {
       if (this.stopped || this.activity.get(sessionID) !== token) return
       const group = this.groupFor(session.model)
       if (!group) return
+      const currentKey = session.model ? modelKey(session.model) : undefined
+      // The user answered "keep" for this exact model: never reroute it.
+      if (currentKey !== undefined && this.pinnedManual.get(sessionID) === currentKey) return
       const candidate = selectCandidate(
         group,
         session.model,
@@ -1029,10 +1074,72 @@ export class ModelAutoRouter {
         candidate &&
         (!session.model || !sameRouteModel(candidate, session.model, group.automatic))
       ) {
+        // A model the router did not set is an explicit user/config choice:
+        // ask before overriding instead of hijacking it silently.
+        if (
+          this.options.askBeforeOverride !== false &&
+          currentKey !== undefined &&
+          this.routerOwned.get(sessionID) !== currentKey
+        ) {
+          await this.requestOverride(sessionID, session.model!, candidate, group)
+          return
+        }
         await this.switchModel(sessionID, candidate)
       }
     } catch {
       if (!this.stopped) this.report("request routing failed")
+    }
+  }
+
+  /**
+   * Registers a "keep or override" question for a manually chosen model and
+   * announces it once per current/proposed pair with a synthetic notice.
+   * No resume: the user's prompt keeps running on their chosen model.
+   */
+  private async requestOverride(
+    sessionID: string,
+    current: ModelRef,
+    candidate: Candidate,
+    group: RouteGroup,
+  ): Promise<void> {
+    const existing = this.overrideRequests.get(sessionID)
+    const currentKey = modelKey(current)
+    const proposedKey = modelKey(candidate)
+    const reused =
+      existing !== undefined &&
+      existing.current === currentKey &&
+      existing.proposed === proposedKey
+    const request: OverrideRequest = {
+      sessionID,
+      current: currentKey,
+      proposed: proposedKey,
+      proposedRef: {
+        providerID: candidate.providerID,
+        id: candidate.id,
+        variant: candidate.variant,
+      },
+      group: group.name,
+      askedAt: reused ? existing!.askedAt : Date.now(),
+    }
+    this.overrideRequests.set(sessionID, request)
+    this.capSessions(this.overrideRequests)
+    if (reused || this.stopped) return
+    try {
+      await this.ctx.session.synthetic({
+        sessionID,
+        text:
+          `Маршрутизатор предлагает ${proposedKey} вместо выбранной вручную ${currentKey}. ` +
+          "Ответьте в GUI плагина (панель «Защита ручного выбора»): оставить или переключить.",
+        description: "Manual model choice: keep or override?",
+        metadata: {
+          source: "opencode-model-autorouter",
+          kind: "override-request",
+          current: currentKey,
+          proposed: proposedKey,
+        },
+      })
+    } catch {
+      if (!this.stopped) this.report("override request notice failed")
     }
   }
 
@@ -1290,6 +1397,7 @@ export class ModelAutoRouter {
       strategy: strategy(this.options.strategy, "free-fastest"),
       defaultGroup: this.options.defaultGroup,
       resumeAfterFailover: this.options.resumeAfterFailover !== false,
+      askBeforeOverride: this.options.askBeforeOverride !== false,
       cooldownMs: positiveNumber(this.options.cooldownMs, 60_000),
       metricAlpha: this.alpha(),
       rescanIntervalMs: positiveNumber(this.options.rescanIntervalMs, 60_000),
@@ -1359,6 +1467,17 @@ export class ModelAutoRouter {
         })
       }),
       disabledModels: [...disabled].sort(),
+      overrideRequests: [...this.overrideRequests.values()].map((request) => ({
+        sessionID: request.sessionID,
+        current: request.current,
+        proposed: request.proposed,
+        group: request.group,
+        askedAt: new Date(request.askedAt).toISOString(),
+      })),
+      pinnedModels: [...this.pinnedManual.entries()].map(([sessionID, model]) => ({
+        sessionID,
+        model,
+      })),
       manualGroups: Object.entries(this.options.groups ?? {}).map(([name, group]) => ({
         name,
         strategy: strategy(group.strategy, strategy(this.options.strategy, "free-fastest")),
@@ -1539,7 +1658,43 @@ export class ModelAutoRouter {
             if (!candidate || !(await this.switchModel(input.sessionID, candidate))) {
               throw new Error("model is unavailable")
             }
-            return { selected: modelKey(candidate) }
+            const key = modelKey(candidate)
+            // A GUI selection is a manual choice: pin it against rerouting and
+            // resolve any pending keep-or-override question for the session.
+            this.routerOwned.delete(input.sessionID)
+            this.pinnedManual.set(input.sessionID, key)
+            this.overrideRequests.delete(input.sessionID)
+            this.capSessions(this.pinnedManual)
+            return { selected: key }
+          },
+          resolveOverrideRequest: async (input: {
+            sessionID: string
+            action: "keep" | "override"
+          }) => {
+            await this.ready
+            const request = this.overrideRequests.get(input.sessionID)
+            if (!request) throw new Error("no override request for this session")
+            if (input.action === "keep") {
+              this.overrideRequests.delete(input.sessionID)
+              this.pinnedManual.set(input.sessionID, request.current)
+              this.capSessions(this.pinnedManual)
+              return { resolved: "keep" as const, model: request.current, pinned: true }
+            }
+            const candidate = [...this.groups.values()]
+              .flatMap((group) => group.candidates)
+              .find((item) => !item.disabled && sameModel(item, request.proposedRef))
+            // On failure the request stays registered so the user can retry.
+            if (!candidate || !(await this.switchModel(input.sessionID, candidate))) {
+              throw new Error("proposed model is unavailable")
+            }
+            this.overrideRequests.delete(input.sessionID)
+            this.pinnedManual.delete(input.sessionID)
+            return { resolved: "override" as const, model: modelKey(candidate), pinned: false }
+          },
+          releaseManualSelection: async (input: { sessionID: string }) => {
+            await this.ready
+            const released = this.pinnedManual.delete(input.sessionID)
+            return { released }
           },
         }),
       )
@@ -1565,6 +1720,9 @@ export class ModelAutoRouter {
     this.failovers.clear()
     this.activity.clear()
     this.failedExecutions.clear()
+    this.routerOwned.clear()
+    this.pinnedManual.clear()
+    this.overrideRequests.clear()
     this.cooldowns.clear()
     this.cbr = undefined
     this.cbrFailedAt = 0

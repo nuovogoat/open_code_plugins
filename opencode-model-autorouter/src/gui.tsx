@@ -31,6 +31,7 @@ interface ConfigurePatch {
   strategy?: Strategy
   defaultGroup?: string
   resumeAfterFailover?: boolean
+  askBeforeOverride?: boolean
   disabledModels?: string[]
   groups?: Record<string, { models: string[]; strategy?: Strategy }>
   cooldownMs?: number
@@ -73,6 +74,14 @@ interface RouterClient {
     input: { sessionID: string; model: string },
     options: RouterOptions,
   ): Promise<{ selected: string }>
+  resolveOverrideRequest(
+    input: { sessionID: string; action: "keep" | "override" },
+    options: RouterOptions,
+  ): Promise<{ resolved: "keep" | "override"; model: string; pinned: boolean }>
+  releaseManualSelection(
+    input: { sessionID: string },
+    options: RouterOptions,
+  ): Promise<{ released: boolean }>
 }
 
 const strategies: Array<{ value: Strategy; label: string }> = [
@@ -859,6 +868,61 @@ export default Plugin.define({
               </div>
             </section>
 
+            <Show when={status()!.overrideRequests.length > 0 || status()!.pinnedModels.length > 0}>
+              <section class="mar-panel">
+                <div class="mar-panel-body">
+                  <h3>Защита ручного выбора</h3>
+                  <p class="mar-help">Роутер не переключает молча модель, выбранную вручную. Подтвердите предложение или снимите закрепление — маршрутизация возобновится автоматически.</p>
+                  <div class="mar-account-list">
+                    <For each={status()!.overrideRequests}>{(request) => (
+                      <div class="mar-account">
+                        <span class="mar-account-name">{request.sessionID.slice(0, 20)}</span>
+                        <span class="mar-badge" data-tone="warning">вопрос</span>
+                        <span class="mar-muted">Вручную: {request.current}</span>
+                        <span class="mar-muted">Предложение: {request.proposed}</span>
+                        <span class="mar-muted">Группа: {request.group}</span>
+                        <div class="mar-account-actions">
+                          <ctx.ui.Button
+                            size="small"
+                            variant="ghost"
+                            disabled={saving()}
+                            onClick={() => void scoped((rpc, options) => rpc.resolveOverrideRequest({ sessionID: request.sessionID, action: "keep" }, options), `Оставлена ${request.current}`)}
+                          >
+                            Оставить {request.current}
+                          </ctx.ui.Button>
+                          <ctx.ui.Button
+                            size="small"
+                            variant="contrast"
+                            disabled={saving()}
+                            onClick={() => void scoped((rpc, options) => rpc.resolveOverrideRequest({ sessionID: request.sessionID, action: "override" }, options), `Переключено на ${request.proposed}`)}
+                          >
+                            Переключить на {request.proposed}
+                          </ctx.ui.Button>
+                        </div>
+                      </div>
+                    )}</For>
+                    <For each={status()!.pinnedModels}>{(pinned) => (
+                      <div class="mar-account">
+                        <span class="mar-account-name">{pinned.sessionID.slice(0, 20)}</span>
+                        <span class="mar-badge" data-tone="free">закреплено</span>
+                        <span class="mar-muted">{pinned.model}</span>
+                        <div class="mar-account-actions">
+                          <ctx.ui.Button
+                            size="small"
+                            variant="ghost"
+                            disabled={saving()}
+                            onClick={() => void scoped((rpc, options) => rpc.releaseManualSelection({ sessionID: pinned.sessionID }, options), "Закрепление снято — маршрутизация снова активна")}
+                          >
+                            Снять закрепление
+                          </ctx.ui.Button>
+                        </div>
+                      </div>
+                    )}</For>
+                  </div>
+                </div>
+              </section>
+            </Show>
+
             <section class="mar-panel">
               <div class="mar-panel-body">
                 <div class="mar-settings-grid">
@@ -873,6 +937,10 @@ export default Plugin.define({
                   <div class="mar-setting">
                     <div class="mar-setting-copy"><span class="mar-setting-title">Продолжение после лимита</span><span class="mar-setting-description">Synthetic-продолжение без повторной отправки prompt</span></div>
                     <ctx.ui.Switch checked={status()!.resumeAfterFailover} disabled={saving()} hideLabel label="Автоматически продолжать после failover" onChange={(resumeAfterFailover) => void configure({ resumeAfterFailover })} />
+                  </div>
+                  <div class="mar-setting">
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Защита ручного выбора модели</span><span class="mar-setting-description">Если модель выставлена не роутером, он спросит перед переключением и не перехватит молча</span></div>
+                    <ctx.ui.Switch checked={status()!.askBeforeOverride} disabled={saving()} hideLabel label="Спрашивать перед перехватом ручного выбора" onChange={(askBeforeOverride) => void configure({ askBeforeOverride })} />
                   </div>
                   <div class="mar-setting">
                     <div class="mar-setting-copy"><span class="mar-setting-title">Ориентировка по курсу ЦБ РФ</span><span class="mar-setting-description">Приблизительные эквиваленты балансов и цен во всех валютах аккаунтов; на маршрутизацию не влияет</span></div>

@@ -330,6 +330,7 @@ function accountSnapshot(
 test("accounts: live refresh updates catalog, cheapest routing and stale fallback status", async () => {
   const ctx = fakeContext([model("a", "same", 8), model("b", "same", 9)], {
     strategy: "cheapest",
+    askBeforeOverride: false,
   })
   let fail = false
   let snapshots = [
@@ -487,7 +488,7 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
 })
 
 test("configuration: disabling the current model routes the next prompt to an alternative", async () => {
-  const ctx = fakeContext([model("a"), model("b")])
+  const ctx = fakeContext([model("a"), model("b")], { askBeforeOverride: false })
   const cleanup = setupModelAutoRouter(ctx, {})
   try {
     await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.rescan !== undefined)
@@ -517,7 +518,9 @@ test("configuration: new options rebuild cached groups even when the rescan fail
 })
 
 test("live routing: prompt admission selects the fastest free model from real step metrics", async () => {
-  const ctx = fakeContext([model("paid", "same", 4), model("slow"), model("fast")])
+  const ctx = fakeContext([model("paid", "same", 4), model("slow"), model("fast")], {
+    askBeforeOverride: false,
+  })
   // Free/paid status comes from account snapshots, not native catalog costs.
   ctx.pricing = {
     async load() {
@@ -841,7 +844,7 @@ test("failover: disabling autorouting during a switch prevents a late continuati
 })
 
 test("failover: user activity during an in-flight switch invalidates stale continuation", async () => {
-  const ctx = fakeContext([model("a"), model("b")])
+  const ctx = fakeContext([model("a"), model("b")], { askBeforeOverride: false })
   const cleanup = setupModelAutoRouter(ctx, {})
   const originalSwitch = ctx.session.switchModel.bind(ctx.session)
   let release!: () => void
@@ -878,6 +881,7 @@ test("failover: user activity during an in-flight switch invalidates stale conti
 
 test("manual default group routes an unrelated current model and RPC select is explicit", async () => {
   const ctx = fakeContext([model("other", "other"), model("a", "one"), model("b", "two")], {
+    askBeforeOverride: false,
     defaultGroup: "chosen",
     groups: {
       chosen: {
@@ -895,6 +899,134 @@ test("manual default group routes an unrelated current model and RPC select is e
     const result = await ctx.rpcHandlers.select({ sessionID: "ses", model: "b/two#max" })
     assert.deepEqual(result, { selected: "b/two#max" })
     assert.equal(modelKey(ctx.current), "b/two#max")
+  } finally {
+    cleanup()
+  }
+})
+
+test("manual choice: router asks before overriding and keep pins the manual model", async () => {
+  // a is paid, b is free: free-fastest would silently switch a -> b by default.
+  // Free/paid status comes from account snapshots, not native catalog costs.
+  const ctx = fakeContext([model("a", "same", 8), model("b")])
+  ctx.pricing = {
+    async load() {
+      return [
+        accountSnapshot("a", { same: { input: 8, output: 8 } }),
+        accountSnapshot("b", { same: { input: 0, output: 0 } }),
+      ]
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.status !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+    assert.equal(ctx.synthetics.length, 1)
+    assert.equal(ctx.synthetics[0].metadata.source, "opencode-model-autorouter")
+    assert.equal(ctx.synthetics[0].metadata.kind, "override-request")
+    assert.equal(ctx.synthetics[0].metadata.current, "a/same")
+    assert.equal(ctx.synthetics[0].metadata.proposed, "b/same")
+    assert.equal(ctx.synthetics[0].resume, undefined)
+    let status = (await ctx.rpcHandlers.status({})) as any
+    assert.equal(status.askBeforeOverride, true)
+    assert.deepEqual(
+      status.overrideRequests.map((item: any) => [item.sessionID, item.current, item.proposed, item.group]),
+      [["ses", "a/same", "b/same", "auto:same"]],
+    )
+    assert.ok(status.overrideRequests[0].askedAt)
+    // A repeated prompt reuses the pending question instead of spamming notices.
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.synthetics.length, 1)
+    // «Оставить» pins the manual model: no rerouting while it stays selected.
+    assert.deepEqual(
+      await ctx.rpcHandlers.resolveOverrideRequest({ sessionID: "ses", action: "keep" }),
+      { resolved: "keep", model: "a/same", pinned: true },
+    )
+    status = (await ctx.rpcHandlers.status({})) as any
+    assert.deepEqual(status.overrideRequests, [])
+    assert.deepEqual(status.pinnedModels, [{ sessionID: "ses", model: "a/same" }])
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+    assert.equal(ctx.synthetics.length, 1)
+    // Releasing the pin re-arms routing; the next prompt asks again.
+    assert.deepEqual(
+      await ctx.rpcHandlers.releaseManualSelection({ sessionID: "ses" }),
+      { released: true },
+    )
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+    assert.equal(ctx.synthetics.length, 2)
+    status = (await ctx.rpcHandlers.status({})) as any
+    assert.equal(status.overrideRequests.length, 1)
+    await assert.rejects(
+      ctx.rpcHandlers.resolveOverrideRequest({ sessionID: "unknown", action: "keep" }),
+      /no override request/u,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test("manual choice: confirming the override switches and marks the model router-owned", async () => {
+  const ctx = fakeContext([model("a", "same", 8), model("b")])
+  ctx.pricing = {
+    async load() {
+      return [
+        accountSnapshot("a", { same: { input: 8, output: 8 } }),
+        accountSnapshot("b", { same: { input: 0, output: 0 } }),
+      ]
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.status !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+    assert.deepEqual(
+      await ctx.rpcHandlers.resolveOverrideRequest({ sessionID: "ses", action: "override" }),
+      { resolved: "override", model: "b/same", pinned: false },
+    )
+    assert.equal(modelKey(ctx.current), "b/same")
+    const status = (await ctx.rpcHandlers.status({})) as any
+    assert.deepEqual(status.overrideRequests, [])
+    assert.deepEqual(status.pinnedModels, [])
+    // The router-set model is owned now: the next prompt neither asks nor switches.
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 1)
+    assert.equal(ctx.synthetics.length, 1)
+    // A stale resolution attempt is rejected.
+    await assert.rejects(
+      ctx.rpcHandlers.resolveOverrideRequest({ sessionID: "ses", action: "keep" }),
+      /no override request/u,
+    )
+  } finally {
+    cleanup()
+  }
+})
+
+test("manual choice: askBeforeOverride=false keeps fully automatic silent routing", async () => {
+  const ctx = fakeContext([model("a", "same", 8), model("b")], { askBeforeOverride: false })
+  ctx.pricing = {
+    async load() {
+      return [
+        accountSnapshot("a", { same: { input: 8, output: 8 } }),
+        accountSnapshot("b", { same: { input: 0, output: 0 } }),
+      ]
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.hooks.has("prompt") && ctx.rpcHandlers.status !== undefined)
+    await ctx.rpcHandlers.rescan({})
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "b")
+    assert.equal(ctx.synthetics.length, 0)
+    const status = (await ctx.rpcHandlers.status({})) as any
+    assert.equal(status.askBeforeOverride, false)
+    assert.deepEqual(status.overrideRequests, [])
+    assert.deepEqual(status.pinnedModels, [])
   } finally {
     cleanup()
   }
@@ -1134,7 +1266,7 @@ test("routing: threshold exclusions disable candidates without touching user swi
 })
 
 test("guardrails: warn marks, exclude reroutes and blocks select, recovery is automatic", async () => {
-  const ctx = fakeContext([model("a", "same"), model("b", "same")])
+  const ctx = fakeContext([model("a", "same"), model("b", "same")], { askBeforeOverride: false })
   const snapshots = [
     { ...accountSnapshot("a", { same: { input: 1, output: 1 } }), balance: { amount: 3, currency: "USD" } },
     accountSnapshot("b", { same: { input: 2, output: 2 } }),

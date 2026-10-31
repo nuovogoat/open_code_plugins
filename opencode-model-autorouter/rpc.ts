@@ -147,6 +147,7 @@ const status = {
     strategy: { type: "string" },
     defaultGroup: { type: "string" },
     resumeAfterFailover: { type: "boolean" },
+    askBeforeOverride: { type: "boolean" },
     cooldownMs: { type: "number" },
     metricAlpha: { type: "number" },
     rescanIntervalMs: { type: "number" },
@@ -203,6 +204,33 @@ const status = {
       },
     },
     disabledModels: { type: "array", items: { type: "string" } },
+    overrideRequests: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          current: { type: "string" },
+          proposed: { type: "string" },
+          group: { type: "string" },
+          askedAt: { type: "string" },
+        },
+        required: ["sessionID", "current", "proposed", "group", "askedAt"],
+        additionalProperties: false,
+      },
+    },
+    pinnedModels: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          model: { type: "string" },
+        },
+        required: ["sessionID", "model"],
+        additionalProperties: false,
+      },
+    },
     manualGroups: {
       type: "array",
       items: {
@@ -238,6 +266,7 @@ const status = {
     "autoDiscover",
     "strategy",
     "resumeAfterFailover",
+    "askBeforeOverride",
     "cooldownMs",
     "metricAlpha",
     "rescanIntervalMs",
@@ -248,6 +277,8 @@ const status = {
     "publicPricing",
     "accounts",
     "disabledModels",
+    "overrideRequests",
+    "pinnedModels",
     "manualGroups",
     "modelsDiscovered",
     "models",
@@ -275,6 +306,7 @@ const configure = {
     strategy: { type: "string" },
     defaultGroup: { type: "string" },
     resumeAfterFailover: { type: "boolean" },
+    askBeforeOverride: { type: "boolean" },
     disabledModels: { type: "array", items: { type: "string" } },
     groups: {
       type: "object",
@@ -362,6 +394,41 @@ export const ModelAutoRouterRpc = Rpc.define({
         type: "object",
         properties: { selected: { type: "string" } },
         required: ["selected"],
+        additionalProperties: false,
+      },
+    },
+    resolveOverrideRequest: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string", minLength: 1 },
+          action: { type: "string", enum: ["keep", "override"] },
+        },
+        required: ["sessionID", "action"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: {
+          resolved: { type: "string", enum: ["keep", "override"] },
+          model: { type: "string" },
+          pinned: { type: "boolean" },
+        },
+        required: ["resolved", "model", "pinned"],
+        additionalProperties: false,
+      },
+    },
+    releaseManualSelection: {
+      input: {
+        type: "object",
+        properties: { sessionID: { type: "string", minLength: 1 } },
+        required: ["sessionID"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { released: { type: "boolean" } },
+        required: ["released"],
         additionalProperties: false,
       },
     },
