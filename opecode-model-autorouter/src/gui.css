@@ -97,6 +97,9 @@
 .mar-price-limit-row:last-of-type { border-bottom: none; }
 .mar-price-limit-currency { min-width: 48px; font-weight: 600; }
 .mar-price-limit-row .mar-number { width: 110px; }
+.mar-site-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--mar-border); }
+.mar-site-row:last-of-type { border-bottom: none; }
+.mar-site-input { flex: 1 1 280px; max-width: 420px; }
 .mar-account-note { flex-basis: 100%; color: var(--mar-muted); font-size: 10px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .mar-orientation { display: block; margin-top: 2px; color: var(--mar-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .mar-group-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }

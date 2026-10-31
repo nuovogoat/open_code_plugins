@@ -192,17 +192,20 @@ try {
   assert.equal(accounts.get("teamorouter").balanceCurrency, "USD")
   assert.equal(accounts.get("plusvibe").balanceCurrency, "RUB")
   if (accounts.has("apimaster")) assert.equal(accounts.get("apimaster").state, "unsupported")
-  // Every displayed price comes from an account snapshot and carries its currency.
+  // Every displayed price comes from a confirmed source (account tariff or
+  // public listing) and carries its currency.
   assert.ok(
     status.models.every((model: any) =>
       model.cost === undefined ||
       (typeof model.costCurrency === "string" &&
-        (model.priceState === "live" || model.priceState === "stale")),
+        ["live", "stale", "public", "public-stale"].includes(model.priceState)),
     ),
   )
   for (const [providerID, account] of accounts) {
     const matched = status.models.filter(
-      (model: any) => model.providerID === providerID && model.priceState !== undefined,
+      (model: any) =>
+        model.providerID === providerID &&
+        (model.priceState === "live" || model.priceState === "stale"),
     ).length
     assert.equal(account.matchedModels, matched, `${providerID} matched-model count is inconsistent`)
   }
@@ -301,6 +304,103 @@ try {
     "cleared limits remove all price marks",
   )
 
+  // Public price discovery needs no account at all: the OpenRouter listing is
+  // published on the provider site. The site may be unreachable from this
+  // network, so absence is tolerated, but a present snapshot must be valid.
+  const withSites = await call("configure", {
+    providerSites: { openrouter: "https://openrouter.ai" },
+  })
+  assert.deepEqual(withSites.providerSites, { openrouter: "https://openrouter.ai" })
+  const publicInfo = withSites.publicPricing.find(
+    (item: any) => item.providerID === "openrouter",
+  )
+  if (publicInfo) {
+    assert.equal(publicInfo.state, "live")
+    assert.ok(
+      publicInfo.origin.startsWith("https://openrouter.ai/"),
+      `unexpected discovery origin: ${publicInfo.origin}`,
+    )
+    assert.ok(publicInfo.matchedModels > 0, "public listing matched no catalog models")
+    const publicModels = withSites.models.filter(
+      (item: any) =>
+        item.providerID === "openrouter" &&
+        (item.priceState === "public" || item.priceState === "public-stale"),
+    )
+    assert.equal(publicModels.length, publicInfo.matchedModels)
+    assert.ok(
+      publicModels.every((item: any) => item.costCurrency === "USD"),
+      "the OpenRouter public listing publishes USD prices",
+    )
+  }
+
+  // Real end-to-end discovery against a loopback listing: the plugin must find
+  // prices published on the provider site without any account or credentials.
+  let loopbackSummary: unknown = "skipped"
+  const listing: { data: Array<Record<string, unknown>> } = { data: [] }
+  const http = await import("node:http")
+  const localServer = http.createServer((_request, response) => {
+    const body = JSON.stringify(listing)
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(body)),
+    })
+    response.end(body)
+  })
+  await new Promise<void>((resolveListen) =>
+    localServer.listen(0, "127.0.0.1", resolveListen),
+  )
+  const port = (localServer.address() as import("node:net").AddressInfo).port
+  try {
+    const unpriced = withSites.models.find((item: any) => item.priceState === undefined)
+    assert.ok(unpriced, "the live catalog has no unpriced model for loopback discovery")
+    listing.data = [
+      { id: unpriced.id, pricing: { prompt: "0.000001", completion: "0.000002" } },
+    ]
+    const site = `http://127.0.0.1:${port}`
+    const loopback = await call("configure", {
+      providerSites: { [unpriced.providerID]: site },
+    })
+    assert.deepEqual(loopback.providerSites, { [unpriced.providerID]: site })
+    const info = loopback.publicPricing.find(
+      (item: any) => item.providerID === unpriced.providerID,
+    )
+    assert.ok(info, "loopback discovery produced no snapshot")
+    assert.equal(info.state, "live")
+    assert.equal(info.origin, `${site}/v1/models`)
+    assert.ok(info.matchedModels >= 1)
+    const discovered = loopback.models.find((item: any) => item.model === unpriced.model)
+    assert.equal(discovered.priceState, "public")
+    assert.equal(discovered.costCurrency, "USD")
+    assert.equal(discovered.cost[0].input, 1)
+    assert.equal(discovered.cost[0].output, 2)
+    loopbackSummary = {
+      providerID: unpriced.providerID,
+      model: unpriced.model,
+      origin: info.origin,
+      matchedModels: info.matchedModels,
+    }
+  } finally {
+    await new Promise<void>((resolveClose) => localServer.close(() => resolveClose()))
+  }
+  // An invalid address is dropped by normalization instead of being stored.
+  const badSites = await call("configure", {
+    providerSites: { openrouter: "http://evil.example" },
+  })
+  assert.deepEqual(badSites.providerSites, {})
+  // Clearing sites drops every snapshot and every public price with it.
+  const withoutSites = await call("configure", { providerSites: {} })
+  assert.deepEqual(withoutSites.providerSites, {})
+  assert.deepEqual(withoutSites.publicPricing, [])
+  assert.ok(
+    withoutSites.models.every(
+      (item: any) =>
+        item.priceState === undefined ||
+        item.priceState === "live" ||
+        item.priceState === "stale",
+    ),
+    "clearing sites removes every public price",
+  )
+
   // ЦБ РФ orientation is opt-in; the public feed may be unreachable from this
   // network, so either absence or a fully valid rate set is accepted.
   const oriented = await call("configure", { cbrOrientation: true })
@@ -319,6 +419,7 @@ try {
   assert.equal(resetStatus.cbr, undefined)
   assert.deepEqual(resetStatus.accountThresholds, {})
   assert.deepEqual(resetStatus.priceLimits, {})
+  assert.deepEqual(resetStatus.providerSites, {})
 
   const candidate = status.groups[0].candidates[0].model
   const selected = await call("select", { sessionID, model: candidate })
@@ -351,6 +452,15 @@ try {
       singletonSelected: singleton?.model,
       selected,
       thresholdsChecked: true,
+      publicPricing: publicInfo
+        ? {
+            providerID: publicInfo.providerID,
+            origin: publicInfo.origin,
+            state: publicInfo.state,
+            matchedModels: publicInfo.matchedModels,
+          }
+        : "openrouter.ai unreachable from this network",
+      loopbackDiscovery: loopbackSummary,
       cbrOrientation: oriented.cbr
         ? { date: oriented.cbr.date, usd: oriented.cbr.rates.USD, stale: oriented.cbr.stale }
         : "feed unreachable from this network",

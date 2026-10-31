@@ -1,18 +1,26 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  extractProviderSite,
   loadAccountSnapshots,
   loadCbrRates,
+  loadPublicPricing,
+  normalizeSiteURL,
   parseCbrDaily,
   parseOpenRouterCreditsBalance,
   parseOpenRouterKeyBalance,
   parseOpenRouterModels,
   parsePlusVibeBalance,
   parsePlusVibeModels,
+  parsePublicModels,
   parseTeamoRouterBalance,
   parseTeamoRouterModels,
+  publicEndpointCandidates,
   withAccountPricing,
+  withPublicPricing,
   type AccountSnapshot,
+  type PriceState,
+  type PublicSnapshot,
 } from "../pricing.ts"
 
 const openRouterPayload = {
@@ -379,4 +387,231 @@ test("cbr: the loader uses only the hardcoded origin without credentials and rej
   const aborted = new AbortController()
   aborted.abort()
   await assert.rejects(loadCbrRates(xmlFetcher(cbrXml, []), aborted.signal))
+})
+
+test("public pricing: site validation accepts https and loopback only, strips credentials", () => {
+  assert.equal(normalizeSiteURL("https://openrouter.ai"), "https://openrouter.ai")
+  assert.equal(normalizeSiteURL("https://openrouter.ai/"), "https://openrouter.ai")
+  assert.equal(normalizeSiteURL("https://openrouter.ai/?ref=x#top"), "https://openrouter.ai")
+  assert.equal(normalizeSiteURL("https://api.example.com/v1"), "https://api.example.com/v1")
+  assert.equal(normalizeSiteURL("http://localhost:8080"), "http://localhost:8080")
+  assert.equal(normalizeSiteURL("http://127.0.0.1/x"), "http://127.0.0.1/x")
+  // Non-loopback http and non-HTTP schemes are never called.
+  assert.equal(normalizeSiteURL("http://example.com"), undefined)
+  assert.equal(normalizeSiteURL("javascript:alert(1)"), undefined)
+  assert.equal(normalizeSiteURL("data:text/html,<script>"), undefined)
+  assert.equal(normalizeSiteURL("file:///C:/secrets"), undefined)
+  // Embedded credentials are rejected instead of being sent anywhere.
+  assert.equal(normalizeSiteURL("https://user:pass@example.com"), undefined)
+  // Garbage values never become addresses.
+  assert.equal(normalizeSiteURL(""), undefined)
+  assert.equal(normalizeSiteURL("not a url"), undefined)
+  assert.equal(normalizeSiteURL(42), undefined)
+  assert.equal(normalizeSiteURL(null), undefined)
+  assert.equal(normalizeSiteURL({ url: "https://example.com" }), undefined)
+  assert.equal(normalizeSiteURL(`https://x.example/${"y".repeat(4096)}`), undefined)
+})
+
+test("public pricing: config baseURL is extracted best-effort and validated", () => {
+  assert.equal(
+    extractProviderSite({ id: "p", settings: { options: { baseURL: "https://api.p.example/v1" } } }),
+    "https://api.p.example/v1",
+  )
+  assert.equal(
+    extractProviderSite({ id: "p", settings: { baseURL: "https://p.example" } }),
+    "https://p.example",
+  )
+  assert.equal(extractProviderSite({ id: "p", baseURL: "https://p.example" }), "https://p.example")
+  assert.equal(extractProviderSite({ id: "p", settings: { options: { baseURL: "http://evil.example" } } }), undefined)
+  assert.equal(extractProviderSite({ id: "p" }), undefined)
+  assert.equal(extractProviderSite(null), undefined)
+  assert.equal(extractProviderSite("https://p.example"), undefined)
+})
+
+test("public pricing: endpoint candidates are ordered, capped and derived from the address", () => {
+  assert.deepEqual(publicEndpointCandidates("https://p.example"), [
+    "https://p.example/v1/models",
+    "https://p.example/api/v1/models",
+    "https://p.example/models",
+    "https://p.example/api/models",
+  ])
+  // An address that already points at a listing is probed first.
+  assert.deepEqual(publicEndpointCandidates("https://p.example/v1/models")[0], "https://p.example/v1/models")
+  assert.equal(publicEndpointCandidates("https://p.example/v1/models").length, 5)
+  assert.deepEqual(publicEndpointCandidates("javascript:alert(1)"), [])
+  assert.deepEqual(publicEndpointCandidates(""), [])
+})
+
+test("public pricing: only the OpenRouter-compatible shape is recognized, nothing is invented", () => {
+  const costs = parsePublicModels({
+    data: [{ id: "m", pricing: { prompt: "0.000001", completion: "0.000002" } }],
+  })
+  assert.deepEqual(costs.get("m"), {
+    currency: "USD",
+    cost: [{ input: 1, output: 2, cache: { read: 0, write: 0 } }],
+  })
+  // A bare top-level array is accepted too.
+  assert.equal(
+    parsePublicModels([{ id: "m", pricing: { prompt: 1e-6, completion: 2e-6 } }]).size,
+    1,
+  )
+  // A plain OpenAI listing without prices yields nothing: no price is guessed.
+  assert.equal(parsePublicModels({ data: [{ id: "m", object: "model", owned_by: "x" }] }).size, 0)
+  // Unknown units/currencies are not interpreted.
+  assert.equal(parsePublicModels({ data: [{ id: "m", cost: { input: 5, output: 9, currency: "RUB" } }] }).size, 0)
+  for (const garbage of [null, undefined, 0, "", "text", [], {}, { data: "x" }, { data: [null, 1, "s"] }]) {
+    assert.equal(parsePublicModels(garbage).size, 0)
+  }
+})
+
+function jsonFetcher(
+  routes: Record<string, { status?: number; body?: unknown; raw?: string; length?: number }>,
+  requests: Array<{ url: string; init?: RequestInit }>,
+) {
+  return (async (url: unknown, init?: RequestInit) => {
+    requests.push({ url: String(url), init })
+    if (init?.signal?.aborted) throw new DOMException("This operation was aborted", "AbortError")
+    const route = routes[String(url)]
+    if (!route) return new Response("not found", { status: 404 })
+    const headers: Record<string, string> = { "content-type": "application/json" }
+    if (route.length !== undefined) headers["content-length"] = String(route.length)
+    return new Response(route.raw ?? JSON.stringify(route.body ?? {}), {
+      status: route.status ?? 200,
+      headers,
+    })
+  }) as typeof fetch
+}
+
+const publicListing = {
+  data: [{ id: "same", pricing: { prompt: "0.000001", completion: "0.000002" } }],
+}
+
+test("public pricing: the loader probes in order, stays anonymous and fails cleanly", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const snapshot = await loadPublicPricing(
+    jsonFetcher(
+      {
+        "https://p.example/v1/models": { status: 500 },
+        "https://p.example/api/v1/models": { body: "<html>not json</html>", raw: "<html>" },
+        "https://p.example/models": { body: publicListing },
+      },
+      requests,
+    ),
+    new AbortController().signal,
+    "p",
+    "https://p.example",
+  )
+  assert.equal(snapshot.origin, "https://p.example/models")
+  assert.equal(snapshot.state, "live")
+  assert.equal(snapshot.providerID, "p")
+  assert.deepEqual([...snapshot.costs.keys()], ["same"])
+  assert.equal(requests.length, 3)
+  for (const request of requests) {
+    const headers = new Headers(request.init?.headers)
+    // Strictly unauthenticated discovery: no credentials in any form.
+    assert.equal(headers.get("authorization"), null)
+    assert.equal(headers.get("cookie"), null)
+    assert.equal(request.init?.credentials, "omit")
+    assert.equal(request.init?.redirect, "error")
+    assert.equal(request.init?.method, undefined)
+  }
+
+  // A listing without recognized prices is not a price source.
+  await assert.rejects(
+    loadPublicPricing(
+      jsonFetcher({}, []),
+      new AbortController().signal,
+      "p",
+      "https://p.example",
+    ),
+  )
+  // Oversized responses are rejected before parsing.
+  await assert.rejects(
+    loadPublicPricing(
+      jsonFetcher({ "https://p.example/v1/models": { body: publicListing, length: 64 * 1024 * 1024 } }, []),
+      new AbortController().signal,
+      "p",
+      "https://p.example",
+    ),
+  )
+  // An invalid address produces no requests at all.
+  const invalid: Array<{ url: string }> = []
+  await assert.rejects(
+    loadPublicPricing(jsonFetcher({}, invalid as never), new AbortController().signal, "p", "http://evil.example"),
+  )
+  assert.equal(invalid.length, 0)
+  // Abort propagates instead of being swallowed.
+  const aborted = new AbortController()
+  aborted.abort()
+  await assert.rejects(loadPublicPricing(jsonFetcher({}, []), aborted.signal, "p", "https://p.example"))
+})
+
+test("public pricing: a hanging endpoint is aborted, not awaited forever", async () => {
+  const controller = new AbortController()
+  const hanging = ((_url: unknown, init?: RequestInit) =>
+    new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () =>
+        reject(new DOMException("This operation was aborted", "AbortError")),
+      )
+    })) as unknown as typeof fetch
+  setTimeout(() => controller.abort(), 20)
+  await assert.rejects(loadPublicPricing(hanging, controller.signal, "p", "https://p.example"))
+})
+
+test("public pricing: account prices win and public prices fill the rest", () => {
+  const models: Array<{
+    providerID: string
+    id: string
+    cost?: Array<{ input: number; output: number }>
+    costCurrency?: string
+    priceState?: PriceState
+  }> = [
+    { providerID: "p", id: "both" },
+    { providerID: "p", id: "only-public" },
+    { providerID: "q", id: "none" },
+  ]
+  const accounts = new Map<string, AccountSnapshot>([
+    [
+      "p",
+      {
+        providerID: "p",
+        state: "live" as const,
+        costs: new Map([["both", { currency: "USD", cost: [{ input: 7, output: 8 }] }]]),
+        pricingSupported: true,
+        balanceSupported: true,
+      },
+    ],
+  ])
+  const publics = new Map<string, PublicSnapshot>([
+    [
+      "p",
+      {
+        providerID: "p",
+        origin: "https://p.example/models",
+        state: "live",
+        fetchedAt: Date.now(),
+        costs: new Map([
+          ["both", { currency: "USD", cost: [{ input: 1, output: 2 }] }],
+          ["only-public", { currency: "USD", cost: [{ input: 3, output: 4 }] }],
+        ]),
+      },
+    ],
+  ])
+  const priced = withPublicPricing(withAccountPricing(models, accounts), publics)
+  const [both, onlyPublic, none] = priced
+  // The account tariff replaces the public listing for the same model.
+  assert.equal(both.priceState, "live")
+  assert.equal(both.cost?.[0].input, 7)
+  assert.equal(onlyPublic.priceState, "public")
+  assert.equal(onlyPublic.costCurrency, "USD")
+  assert.equal(onlyPublic.cost?.[0].output, 4)
+  assert.equal(none.priceState, undefined)
+  assert.equal(none.cost, undefined)
+
+  // A stale public listing is marked as cache, never as fresh.
+  const stalePublics = new Map([
+    ["p", { ...publics.get("p")!, state: "stale" as const }],
+  ])
+  const stale = withPublicPricing(withAccountPricing(models, new Map()), stalePublics)
+  assert.equal(stale[1].priceState, "public-stale")
 })

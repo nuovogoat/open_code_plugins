@@ -39,6 +39,7 @@ interface ConfigurePatch {
   accountThresholds?: Record<string, AccountThreshold>
   priceLimits?: Record<string, PriceLimits>
   cbrOrientation?: boolean
+  providerSites?: Record<string, string>
   reset?: boolean
 }
 
@@ -112,6 +113,7 @@ export default Plugin.define({
       const [thresholdMin, setThresholdMin] = createSignal("")
       const [thresholdAction, setThresholdAction] = createSignal<"warn" | "exclude">("warn")
       const [priceDrafts, setPriceDrafts] = createSignal<Record<string, PriceLimitDraft>>({})
+      const [siteDrafts, setSiteDrafts] = createSignal<Record<string, string>>({})
 
       const selectedSession = () => {
         const sessions = ctx.sessions.list()
@@ -387,6 +389,56 @@ export default Plugin.define({
         }
       }
 
+      /** Providers offered for public price discovery: configured sites plus every catalog provider. */
+      const publicProviders = createMemo(() => {
+        const current = status()
+        if (!current) return []
+        return [
+          ...new Set([
+            ...Object.keys(current.providerSites ?? {}),
+            ...current.models.map((model) => model.providerID),
+          ]),
+        ].sort()
+      })
+      const siteDraft = (providerID: string): string =>
+        siteDrafts()[providerID] ?? status()?.providerSites?.[providerID] ?? ""
+      const publicInfo = (providerID: string) =>
+        status()?.publicPricing.find((item) => item.providerID === providerID)
+      const saveSite = async (providerID: string) => {
+        const text = siteDraft(providerID).trim()
+        const sites: Record<string, string> = { ...(status()?.providerSites ?? {}) }
+        if (text === "") {
+          delete sites[providerID]
+        } else {
+          let url: URL
+          try {
+            url = new URL(text)
+          } catch {
+            setLocalError("Адрес должен быть полным URL, например https://provider.example")
+            return
+          }
+          const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+          if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+            setLocalError("Допустимы только https-адреса (http — для localhost)")
+            return
+          }
+          sites[providerID] = text
+        }
+        const saved = await configure(
+          { providerSites: sites },
+          text === ""
+            ? `Адрес ${providerID} удалён`
+            : `Адрес ${providerID} сохранён: публичные цены обновятся при следующем сканировании`,
+        )
+        if (saved) {
+          setSiteDrafts((previous) => {
+            const next = { ...previous }
+            delete next[providerID]
+            return next
+          })
+        }
+      }
+
       const editGroup = (group?: ManualGroup) => {
         setEditorOriginal(group?.name ?? "")
         setEditorName(group?.name ?? `route-${(status()?.manualGroups.length ?? 0) + 1}`)
@@ -488,7 +540,11 @@ export default Plugin.define({
             ? "Аккаунтный тариф провайдера; первый тариф"
             : model.priceState === "stale"
               ? "Кэш аккаунтного тарифа: обновление не удалось; первый тариф"
-              : "Аккаунтный тариф для этой модели не подтверждён"
+              : model.priceState === "public"
+                ? "Публичный тариф с сайта провайдера (без входа); первый тариф. Аккаунтный тариф точнее — задайте ключ, если он доступен"
+                : model.priceState === "public-stale"
+                  ? "Кэш публичного тарифа: обновить не удалось; первый тариф"
+                  : "Ни аккаунтный, ни публичный тариф для этой модели не подтверждён"
         return (
           <div class="mar-model-row" data-disabled={!model.routingEnabled}>
             <div class="mar-model-main">
@@ -523,7 +579,7 @@ export default Plugin.define({
             </div>
             <div class="mar-metric" title={priceTitle}>
               <span class="mar-metric-value">{formatPrice(tier?.input, model.costCurrency)} / {formatPrice(tier?.output, model.costCurrency)}</span>
-              <span class="mar-metric-label">{model.costCurrency ?? "—"} / 1M input · output{model.priceState === "live" ? " · live" : model.priceState === "stale" ? " · stale" : ""}</span>
+              <span class="mar-metric-label">{model.costCurrency ?? "—"} / 1M input · output{model.priceState === "live" ? " · live" : model.priceState === "stale" ? " · stale" : model.priceState === "public" ? " · public" : model.priceState === "public-stale" ? " · public stale" : ""}</span>
               <Show when={priceOrientation(model).length > 0}>
                 <span class="mar-orientation" title={orientationTitle()}>
                   ≈ {priceOrientation(model).map((item) => formatPrice(item.value, item.unit)).join(" · ")}
@@ -714,6 +770,55 @@ export default Plugin.define({
                       : "Курс ЦБ РФ ещё не загружен: ориентировка появится после первого успешного запроса к публичному API ЦБ РФ."}
                   </p>
                 </Show>
+              </div>
+            </section>
+
+            <section class="mar-panel">
+              <div class="mar-panel-body">
+                <h3>Публичные цены без входа</h3>
+                <p class="mar-help">Укажите адрес заглавной страницы поставщика (например https://openrouter.ai) — роутер сам найдёт публичный список моделей с ценами и будет показывать их без входа в аккаунт. Запросы к этим адресам идут строго без ключей и cookies; цены в нераспознанном формате не отображаются и не выдумываются. Аккаунтный тариф всегда приоритетнее публичного; для точного мониторинга расходов можно задать аккаунтный ключ.</p>
+                <For each={publicProviders()}>{(providerID) => (
+                  <div class="mar-site-row">
+                    <span class="mar-price-limit-currency">{providerID}</span>
+                    <Show when={publicInfo(providerID)}>
+                      <span
+                        class="mar-badge"
+                        data-tone={publicInfo(providerID)!.state === "live" ? "free" : "warning"}
+                        title={publicInfo(providerID)!.origin}
+                      >
+                        {publicInfo(providerID)!.state === "live"
+                          ? `публичный тариф · ${publicInfo(providerID)!.matchedModels} моделей`
+                          : "публичный тариф (кэш)"}
+                      </span>
+                    </Show>
+                    <input
+                      class="mar-site-input"
+                      type="url"
+                      placeholder="https://provider.example — адрес заглавной страницы"
+                      value={siteDraft(providerID)}
+                      disabled={saving()}
+                      onInput={(event) => setSiteDrafts({ ...siteDrafts(), [providerID]: event.currentTarget.value })}
+                    />
+                    <ctx.ui.Button
+                      size="small"
+                      variant="contrast"
+                      busy={saving()}
+                      onClick={() => void saveSite(providerID)}
+                    >
+                      {siteDraft(providerID).trim() === "" && status()?.providerSites?.[providerID] ? "Удалить адрес" : "Сохранить адрес"}
+                    </ctx.ui.Button>
+                    <Show when={VAULT_PROVIDER_IDS.includes(providerID) && !status()?.accounts.find((account) => account.providerID === providerID)?.pluginKey}>
+                      <ctx.ui.Button
+                        size="small"
+                        variant="ghost"
+                        disabled={saving()}
+                        onClick={() => { setKeyProvider(providerID); setKeyDraft("") }}
+                      >
+                        Войти для точных расходов
+                      </ctx.ui.Button>
+                    </Show>
+                  </div>
+                )}</For>
               </div>
             </section>
 

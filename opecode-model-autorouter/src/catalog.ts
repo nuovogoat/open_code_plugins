@@ -1,6 +1,8 @@
 export type Strategy = "free-fastest" | "fastest" | "cheapest" | "manual"
 export type Grouping = "provider" | "model" | "route" | "price" | "speed"
 export type Sorting = "name" | "provider" | "price" | "speed" | "ttfb"
+/** Account tariffs (`live`/`stale`) always take priority over public listings. */
+export type PriceState = "live" | "stale" | "public" | "public-stale"
 
 export interface CatalogModel {
   model: string
@@ -10,7 +12,7 @@ export interface CatalogModel {
   enabled: boolean
   routingEnabled: boolean
   costCurrency?: string
-  priceState?: "live" | "stale"
+  priceState?: PriceState
   free: boolean
   available: boolean
   cooldownMs: number
@@ -69,6 +71,17 @@ export interface CbrInfo {
   rates: Record<string, number>
 }
 
+/** Result of unauthenticated public price discovery for one provider site. */
+export interface PublicPricingInfo {
+  providerID: string
+  /** Exact endpoint URL that returned recognized prices. */
+  origin: string
+  state: "live" | "stale"
+  fetchedAt: string
+  stale: boolean
+  matchedModels: number
+}
+
 /**
  * Providers whose account key can be stored in the plugin vault. Mirrors
  * `VAULT_PROVIDERS` in vault.ts and the RPC enum in rpc.ts (kept in sync by
@@ -104,6 +117,8 @@ export interface RouterStatus {
   priceLimits: Record<string, PriceLimits>
   cbrOrientation: boolean
   cbr?: CbrInfo
+  providerSites: Record<string, string>
+  publicPricing: PublicPricingInfo[]
   accounts: AccountInfo[]
   disabledModels: string[]
   manualGroups: ManualGroup[]

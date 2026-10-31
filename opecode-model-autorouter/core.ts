@@ -1,12 +1,18 @@
 import {
+  extractProviderSite,
   loadAccountSnapshots,
   loadCbrRates,
+  loadPublicPricing,
+  normalizeSiteURL,
   withAccountPricing,
+  withPublicPricing,
   type AccountKey,
   type AccountProvider,
   type AccountSnapshot,
   type CbrRates,
   type ModelCost,
+  type PriceState,
+  type PublicSnapshot,
 } from "./pricing.ts"
 import { openAccountVault, VAULT_PROVIDERS, type AccountVault } from "./vault.ts"
 
@@ -34,7 +40,7 @@ export interface ModelInfo extends ModelRef {
   }
   cost?: ModelCost[]
   costCurrency?: string
-  priceState?: "live" | "stale"
+  priceState?: PriceState
 }
 
 interface GroupOptions {
@@ -76,6 +82,12 @@ export interface RouterOptions {
   accountThresholds?: Record<string, AccountThreshold>
   /** Price bounds keyed by price currency; applied to every confirmed account price. */
   priceLimits?: Record<string, PriceLimits>
+  /**
+   * Provider homepage/API addresses for unauthenticated public price discovery.
+   * Requests to these addresses never carry credentials; account keys are only
+   * ever sent to the fixed account-API origins in pricing.ts.
+   */
+  providerSites?: Record<string, string>
   cbrOrientation?: boolean
 }
 
@@ -161,6 +173,10 @@ const STORAGE_KEY = "router-options-v1"
 const CBR_TTL_MS = 6 * 60 * 60_000
 /** After a failed fetch the next attempt waits ~15 minutes; stale rates keep their date. */
 const CBR_RETRY_MS = 15 * 60_000
+/** Public price listings are re-fetched at most once per ~6 hours per provider. */
+const PUBLIC_TTL_MS = 6 * 60 * 60_000
+/** After a failed public discovery the next attempt waits ~30 minutes. */
+const PUBLIC_RETRY_MS = 30 * 60_000
 const CONTINUE_TEXT =
   "The previous model provider became unavailable. Continue the existing task using the conversation and tool results already present. Do not repeat completed side effects."
 const EVENT_TYPES = [
@@ -229,6 +245,9 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   const input = value as Record<string, unknown>
   const result: RouterOptions = {}
+  /** Record keys come from user input; "__proto__" must never become a key. */
+  const safeKey = (key: string) => key.trim().slice(0, 80)
+  const usable = (key: string) => key !== "" && key !== "__proto__"
   for (const key of ["enabled", "autoDiscover", "resumeAfterFailover", "cbrOrientation"] as const) {
     if (typeof input[key] === "boolean") result[key] = input[key]
   }
@@ -254,8 +273,8 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
   if (input.groups && typeof input.groups === "object" && !Array.isArray(input.groups)) {
     const groups: Record<string, GroupOptions> = {}
     for (const [rawName, value] of Object.entries(input.groups).slice(0, 100)) {
-      const name = rawName.trim().slice(0, 80)
-      if (!name || !value || typeof value !== "object" || Array.isArray(value)) continue
+      const name = safeKey(rawName)
+      if (!usable(name) || !value || typeof value !== "object" || Array.isArray(value)) continue
       const group = value as GroupOptions
       if (!Array.isArray(group.models)) continue
       const models = group.models.flatMap((model) => {
@@ -278,8 +297,8 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
   ) {
     const thresholds: Record<string, AccountThreshold> = {}
     for (const [rawProvider, value] of Object.entries(input.accountThresholds).slice(0, 100)) {
-      const providerID = rawProvider.trim().slice(0, 80)
-      if (!providerID || !value || typeof value !== "object" || Array.isArray(value)) continue
+      const providerID = safeKey(rawProvider)
+      if (!usable(providerID) || !value || typeof value !== "object" || Array.isArray(value)) continue
       const entry = value as Record<string, unknown>
       const threshold: AccountThreshold = {}
       if (
@@ -332,6 +351,21 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
       }
     }
     result.priceLimits = limits
+  }
+  if (
+    input.providerSites &&
+    typeof input.providerSites === "object" &&
+    !Array.isArray(input.providerSites)
+  ) {
+    const sites: Record<string, string> = {}
+    for (const [rawProvider, value] of Object.entries(input.providerSites).slice(0, 50)) {
+      const providerID = safeKey(rawProvider)
+      if (!usable(providerID)) continue
+      const site = normalizeSiteURL(value)
+      // Invalid addresses are dropped, so configure can also clear them.
+      if (site) sites[providerID] = site
+    }
+    result.providerSites = sites
   }
   return result
 }
@@ -627,6 +661,10 @@ export class ModelAutoRouter {
   }
   private cbr: CbrRates | undefined
   private cbrFailedAt = 0
+  private publicPricing = new Map<string, PublicSnapshot>()
+  private readonly publicFailedAt = new Map<string, number>()
+  private readonly publicSites = new Map<string, string>()
+  private autoSites = new Map<string, string>()
   private vault: AccountVault | undefined
   private vaultProviders = new Set<string>()
   private refreshing: Promise<void> | undefined
@@ -696,7 +734,10 @@ export class ModelAutoRouter {
       if (this.stopped) throw new Error("router is unavailable")
       this.replaceOptions(next)
       if (next.enabled === false || next.resumeAfterFailover === false) this.pending.clear()
-      this.models = withAccountPricing(this.catalogModels, this.accounts)
+      this.models = withPublicPricing(
+        withAccountPricing(this.catalogModels, this.accounts),
+        this.publicPricing,
+      )
       this.rebuildGroups()
       this.scheduleRescan()
       await this.refresh()
@@ -781,6 +822,14 @@ export class ModelAutoRouter {
         return
       }
       const listed = this.ctx.provider ? await this.ctx.provider.list() : { data: [] as AccountProvider[] }
+      // Best-effort public discovery addresses from OpenCode provider config; the
+      // manual `providerSites` option always wins over these.
+      const autoSites = new Map<string, string>()
+      for (const provider of listed.data) {
+        const site = extractProviderSite(provider)
+        if (site) autoSites.set(provider.id, site)
+      }
+      this.autoSites = autoSites
       const vaultIDs = (await this.vault?.providers()) ?? []
       if (this.stopped) return
       this.vaultProviders = new Set(vaultIDs)
@@ -805,6 +854,73 @@ export class ModelAutoRouter {
           snapshot.state === "live" ? { ...snapshot, state: "stale" as const } : snapshot,
         ]),
       )
+    }
+  }
+
+  /**
+   * Unauthenticated public price discovery for providers with a known site
+   * address (manual `providerSites` first, then OpenCode config `baseURL`).
+   * Results are cached ~6 hours; failures retry after ~30 minutes and keep the
+   * last successful listing as stale instead of presenting it as fresh.
+   * Requests never carry credentials or account keys.
+   */
+  private async updatePublicPricing(): Promise<void> {
+    const sites = new Map<string, string>()
+    for (const [providerID, site] of this.autoSites) sites.set(providerID, site)
+    for (const [providerID, site] of Object.entries(this.options.providerSites ?? {})) {
+      sites.set(providerID, site)
+    }
+    // Providers without a configured address keep no cached public prices.
+    for (const providerID of [...this.publicPricing.keys()]) {
+      if (!sites.has(providerID)) this.publicPricing.delete(providerID)
+    }
+    for (const providerID of [...this.publicFailedAt.keys()]) {
+      if (!sites.has(providerID)) this.publicFailedAt.delete(providerID)
+    }
+    // A new or changed address invalidates the cache and the failure backoff,
+    // so a corrected site is probed immediately instead of after ~30 minutes.
+    for (const [providerID, site] of sites) {
+      if (this.publicSites.get(providerID) !== site) {
+        this.publicPricing.delete(providerID)
+        this.publicFailedAt.delete(providerID)
+      }
+    }
+    for (const providerID of [...this.publicSites.keys()]) {
+      if (!sites.has(providerID)) this.publicSites.delete(providerID)
+    }
+    for (const [providerID, site] of sites) this.publicSites.set(providerID, site)
+    const now = Date.now()
+    const pending = [...sites].filter(([providerID]) => {
+      const cached = this.publicPricing.get(providerID)
+      if (cached && now - cached.fetchedAt < PUBLIC_TTL_MS) return false
+      const failed = this.publicFailedAt.get(providerID)
+      if (failed && now - failed < PUBLIC_RETRY_MS) return false
+      return true
+    })
+    // Bounded concurrency: at most four providers probed in parallel.
+    const CHUNK = 4
+    for (let index = 0; index < pending.length; index += CHUNK) {
+      const batch = pending.slice(index, index + CHUNK)
+      const results = await Promise.allSettled(
+        batch.map(([providerID, site]) =>
+          loadPublicPricing(globalThis.fetch, this.lifecycle.signal, providerID, site),
+        ),
+      )
+      if (this.stopped) return
+      results.forEach((result, position) => {
+        const providerID = batch[position][0]
+        if (result.status === "fulfilled") {
+          this.publicPricing.set(providerID, result.value)
+          this.publicFailedAt.delete(providerID)
+          return
+        }
+        if (this.lifecycle.signal.aborted) return
+        this.publicFailedAt.set(providerID, Date.now())
+        const cached = this.publicPricing.get(providerID)
+        if (cached && cached.state === "live") {
+          this.publicPricing.set(providerID, { ...cached, state: "stale" })
+        }
+      })
     }
   }
 
@@ -847,11 +963,15 @@ export class ModelAutoRouter {
         this.ctx.model.list({ types: ["chat"] }),
         this.updateAccounts(),
         this.updateCbr(),
+        this.updatePublicPricing(),
       ])
       if (this.stopped) return
       if (listed.status === "fulfilled") this.catalogModels = listed.value.data
       else this.report("model scan failed")
-      this.models = withAccountPricing(this.catalogModels, this.accounts)
+      this.models = withPublicPricing(
+        withAccountPricing(this.catalogModels, this.accounts),
+        this.publicPricing,
+      )
       this.rebuildGroups()
       this.refreshing = undefined
     })().finally(() => {
@@ -1188,6 +1308,19 @@ export class ModelAutoRouter {
         ]),
       ),
       cbrOrientation: this.options.cbrOrientation === true,
+      providerSites: { ...(this.options.providerSites ?? {}) },
+      publicPricing: [...this.publicPricing.values()].map((snapshot) => ({
+        providerID: snapshot.providerID,
+        origin: snapshot.origin,
+        state: snapshot.state,
+        fetchedAt: new Date(snapshot.fetchedAt).toISOString(),
+        stale: now - snapshot.fetchedAt > PUBLIC_TTL_MS,
+        matchedModels: this.models.filter(
+          (model) =>
+            model.providerID === snapshot.providerID &&
+            (model.priceState === "public" || model.priceState === "public-stale"),
+        ).length,
+      })),
       cbr: this.cbr
         ? {
             date: this.cbr.date,
@@ -1198,7 +1331,9 @@ export class ModelAutoRouter {
         : undefined,
       accounts: [...this.accounts.values()].map((snapshot) => {
         const matched = this.models.filter(
-          (model) => model.providerID === snapshot.providerID && model.priceState !== undefined,
+          (model) =>
+            model.providerID === snapshot.providerID &&
+            (model.priceState === "live" || model.priceState === "stale"),
         ).length
         return defined({
           providerID: snapshot.providerID,

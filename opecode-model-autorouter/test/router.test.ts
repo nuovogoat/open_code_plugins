@@ -1179,6 +1179,177 @@ test("guardrails: warn marks, exclude reroutes and blocks select, recovery is au
 const cbrXmlFixture = `<?xml version="1.0" encoding="windows-1251"?>
 <ValCurs Date="31.10.2026"><Valute><CharCode>USD</CharCode><Nominal>1</Nominal><Value>92,5123</Value><VunitRate>92,5123</VunitRate></Valute></ValCurs>`
 
+test("public pricing: discovery without credentials fills prices, account wins, clearing stops requests", async () => {
+  const ctx = fakeContext([model("pub", "same"), model("acc", "same")], {
+    providerSites: { pub: "https://pub.example", acc: "https://acc.example" },
+  })
+  ctx.pricing = {
+    async load() {
+      return [accountSnapshot("acc", { same: { input: 3, output: 4 } })]
+    },
+  }
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+    requests.push({ url: String(url), init })
+    // Discovery is strictly anonymous: any credential would be a leak.
+    assert.equal(new Headers(init?.headers).get("authorization"), null)
+    assert.equal(init?.credentials, "omit")
+    if (String(url).startsWith("https://pub.example/")) {
+      return new Response(
+        JSON.stringify({
+          data: [{ id: "same", pricing: { prompt: "0.000001", completion: "0.000002" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response("nope", { status: 404 })
+  }) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    let status = (await ctx.rpcHandlers.rescan({})) as any
+    const pubModel = status.models.find((item: any) => item.model === "pub/same")
+    assert.equal(pubModel.priceState, "public")
+    assert.equal(pubModel.costCurrency, "USD")
+    assert.equal(pubModel.cost[0].input, 1)
+    assert.equal(pubModel.cost[0].output, 2)
+    // The account tariff still wins over public discovery for its provider.
+    const accModel = status.models.find((item: any) => item.model === "acc/same")
+    assert.equal(accModel.priceState, "live")
+    assert.equal(accModel.cost[0].input, 3)
+    assert.deepEqual(status.providerSites, {
+      pub: "https://pub.example",
+      acc: "https://acc.example",
+    })
+    const pubInfo = status.publicPricing.find((item: any) => item.providerID === "pub")
+    assert.equal(pubInfo.state, "live")
+    assert.equal(pubInfo.matchedModels, 1)
+    assert.equal(pubInfo.origin, "https://pub.example/v1/models")
+    // A site without a recognized listing produces no snapshot and no prices.
+    assert.ok(!status.publicPricing.some((item: any) => item.providerID === "acc"))
+    assert.equal(
+      status.accounts.find((item: any) => item.providerID === "acc").matchedModels,
+      1,
+    )
+
+    // Cached listings are reused within the TTL: a rescan makes no new requests.
+    const before = requests.length
+    await ctx.rpcHandlers.rescan({})
+    assert.equal(requests.length, before)
+
+    // Global price limits also apply to public prices.
+    status = (await ctx.rpcHandlers.configure({
+      priceLimits: { USD: { inputMax: 0.5, action: "exclude" } },
+    })) as any
+    const breached = status.models.find((item: any) => item.model === "pub/same")
+    assert.equal(breached.priceLimitBreached, true)
+    assert.equal(breached.thresholdExcluded, true)
+    status = (await ctx.rpcHandlers.configure({ priceLimits: {} })) as any
+
+    // Clearing the address drops the snapshot and stops all discovery requests.
+    status = (await ctx.rpcHandlers.configure({ providerSites: {} })) as any
+    assert.deepEqual(status.providerSites, {})
+    assert.deepEqual(status.publicPricing, [])
+    const cleared = status.models.find((item: any) => item.model === "pub/same")
+    assert.equal(cleared.priceState, undefined)
+    assert.equal(cleared.cost, undefined)
+    const afterClear = requests.length
+    await ctx.rpcHandlers.rescan({})
+    assert.equal(requests.length, afterClear)
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
+test("public pricing: discovery failures keep the router alive and never present cache as fresh", async () => {
+  const ctx = fakeContext([model("pub", "same")], {
+    providerSites: { pub: "https://pub.example" },
+  })
+  ctx.pricing = {
+    async load() {
+      return []
+    },
+  }
+  let fail = false
+  const listing = JSON.stringify({
+    data: [{ id: "same", pricing: { prompt: "0.000001", completion: "0.000002" } }],
+  })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => {
+    if (fail) throw new Error("network down")
+    return new Response(listing, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    const status = (await ctx.rpcHandlers.rescan({})) as any
+    assert.equal(
+      status.models.find((item: any) => item.model === "pub/same").priceState,
+      "public",
+    )
+    // Within the TTL a failing network changes nothing: the cached live listing stays.
+    fail = true
+    const again = (await ctx.rpcHandlers.rescan({})) as any
+    assert.equal(
+      again.models.find((item: any) => item.model === "pub/same").priceState,
+      "public",
+    )
+    assert.equal(again.publicPricing[0].state, "live")
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
+test("public pricing: a changed site address is probed immediately despite failure backoff", async () => {
+  const ctx = fakeContext([model("pub", "same")], {
+    providerSites: { pub: "https://dead.example" },
+  })
+  ctx.pricing = {
+    async load() {
+      return []
+    },
+  }
+  const listing = JSON.stringify({
+    data: [{ id: "same", pricing: { prompt: "0.000001", completion: "0.000002" } }],
+  })
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (url: unknown) => {
+    if (String(url).startsWith("https://good.example/")) {
+      return new Response(listing, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    }
+    return new Response("nope", { status: 404 })
+  }) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    const failed = (await ctx.rpcHandlers.rescan({})) as any
+    assert.deepEqual(failed.publicPricing, [])
+    // A corrected address must not wait out the ~30 minute failure backoff.
+    const status = (await ctx.rpcHandlers.configure({
+      providerSites: { pub: "https://good.example" },
+    })) as any
+    const info = status.publicPricing.find((item: any) => item.providerID === "pub")
+    assert.ok(info, "the corrected site was not probed immediately")
+    assert.equal(info.state, "live")
+    assert.equal(
+      status.models.find((item: any) => item.model === "pub/same").priceState,
+      "public",
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
 test("cbr: orientation is opt-in, cached, display-only and cleared when switched off", async () => {
   const ctx = fakeContext([model("a", "same"), model("b", "same")])
   ctx.pricing = {

@@ -77,7 +77,7 @@ const model = {
     priceLimitBreached: { type: "boolean" },
     thresholdExcluded: { type: "boolean" },
     costCurrency: { type: "string" },
-    priceState: { type: "string", enum: ["live", "stale"] },
+    priceState: { type: "string", enum: ["live", "stale", "public", "public-stale"] },
     variants: { type: "array", items: { type: "string" } },
     cost,
     limit: {
@@ -153,6 +153,23 @@ const status = {
     accountThresholds,
     priceLimits,
     cbrOrientation: { type: "boolean" },
+    providerSites: { type: "object", additionalProperties: { type: "string" } },
+    publicPricing: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          providerID: { type: "string" },
+          origin: { type: "string" },
+          state: { type: "string", enum: ["live", "stale"] },
+          fetchedAt: { type: "string" },
+          stale: { type: "boolean" },
+          matchedModels: { type: "number" },
+        },
+        required: ["providerID", "origin", "state", "fetchedAt", "stale", "matchedModels"],
+        additionalProperties: false,
+      },
+    },
     cbr: {
       type: "object",
       properties: {
@@ -227,6 +244,8 @@ const status = {
     "accountThresholds",
     "priceLimits",
     "cbrOrientation",
+    "providerSites",
+    "publicPricing",
     "accounts",
     "disabledModels",
     "manualGroups",
@@ -280,6 +299,7 @@ const configure = {
     accountThresholds,
     priceLimits,
     cbrOrientation: { type: "boolean" },
+    providerSites: { type: "object", additionalProperties: { type: "string" } },
     reset: { type: "boolean" },
   },
   additionalProperties: false,

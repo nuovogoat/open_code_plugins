@@ -17,6 +17,13 @@ export interface AccountBalance {
 
 export type AccountState = "live" | "stale" | "unsupported"
 
+/**
+ * Where a displayed price came from: `live`/`stale` are account-API tariffs,
+ * `public`/`public-stale` are unauthenticated listings published by the
+ * provider site itself. Account prices always win over public prices.
+ */
+export type PriceState = "live" | "stale" | "public" | "public-stale"
+
 /** Where the account credential came from: OpenCode connections or the plugin-owned vault. */
 export type AccountKeySource = "plugin" | "opencode"
 
@@ -46,7 +53,7 @@ interface PricedModel {
   id: string
   cost?: ModelCost[]
   costCurrency?: string
-  priceState?: "live" | "stale"
+  priceState?: PriceState
 }
 
 const OPENROUTER_API = "https://openrouter.ai/api/v1"
@@ -413,6 +420,168 @@ export async function loadCbrRates(fetcher: typeof fetch, signal: AbortSignal): 
     clearTimeout(timeout)
     signal.removeEventListener("abort", abort)
   }
+}
+
+/** Unauthenticated public price listing published by the provider site itself. */
+export interface PublicSnapshot {
+  providerID: string
+  /** Exact endpoint URL that returned recognized prices. */
+  origin: string
+  state: "live" | "stale"
+  fetchedAt: number
+  costs: ReadonlyMap<string, AccountModelCost>
+}
+
+const PUBLIC_MAX_BYTES = 16 * 1024 * 1024
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"])
+
+/**
+ * Validates a user- or config-provided provider site address. Only https
+ * (plus http for loopback testing) is accepted, embedded credentials are
+ * rejected, and query/fragment are dropped. Anything else is not an address
+ * the plugin may call, and nothing is guessed.
+ */
+export function normalizeSiteURL(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const text = value.trim()
+  // An address is never truncated: an overlong value is not a usable URL.
+  if (!text || text.length > 2048) return undefined
+  let url: URL
+  try {
+    url = new URL(text)
+  } catch {
+    return undefined
+  }
+  if (url.username || url.password) return undefined
+  const loopback = LOOPBACK_HOSTS.has(url.hostname)
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return undefined
+  return `${url.origin}${url.pathname.replace(/\/+$/u, "")}`
+}
+
+/**
+ * Best-effort extraction of the provider's own API base from OpenCode provider
+ * info (config-provided `baseURL`); used only for unauthenticated public price
+ * discovery and never for account requests, which stay on fixed origins.
+ */
+export function extractProviderSite(provider: unknown): string | undefined {
+  const root = record(provider)
+  const settings = record(root?.settings)
+  const options = record(settings?.options)
+  return (
+    normalizeSiteURL(options?.baseURL) ??
+    normalizeSiteURL(settings?.baseURL) ??
+    normalizeSiteURL(root?.baseURL)
+  )
+}
+
+/**
+ * Ordered endpoint candidates for public discovery. If the address already
+ * points at a listing it is tried first; otherwise common OpenAI-compatible
+ * listing paths are probed. At most five GET requests per provider per refresh.
+ */
+export function publicEndpointCandidates(site: string): string[] {
+  const normalized = normalizeSiteURL(site)
+  if (!normalized) return []
+  const list: string[] = []
+  const push = (value: string) => {
+    if (!list.includes(value)) list.push(value)
+  }
+  if (/\/models$/u.test(normalized)) push(normalized)
+  push(`${normalized}/v1/models`)
+  push(`${normalized}/api/v1/models`)
+  push(`${normalized}/models`)
+  push(`${normalized}/api/models`)
+  return list.slice(0, 5)
+}
+
+/**
+ * Public listings are recognized only in the OpenRouter-compatible shape
+ * (`pricing.prompt`/`pricing.completion`, USD per token — the documented unit
+ * of that format). A listing without recognized prices yields nothing; prices
+ * in an unknown shape or unit are never invented.
+ */
+export function parsePublicModels(payload: unknown): ReadonlyMap<string, AccountModelCost> {
+  return parseOpenRouterModels(Array.isArray(payload) ? { data: payload } : payload)
+}
+
+async function requestPublicJSON(
+  fetcher: typeof fetch,
+  url: string,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  const timeout = setTimeout(() => controller.abort(), 15_000)
+  timeout.unref?.()
+  if (signal.aborted) abort()
+  else signal.addEventListener("abort", abort, { once: true })
+  try {
+    // Strictly unauthenticated: no credentials, no authorization, no cookies.
+    const response = await fetcher(url, {
+      headers: { accept: "application/json" },
+      cache: "no-cache",
+      credentials: "omit",
+      redirect: "error",
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(`public API returned HTTP ${response.status}`)
+    const length = Number(response.headers.get("content-length"))
+    if (Number.isFinite(length) && length > PUBLIC_MAX_BYTES) {
+      throw new Error("public API response is too large")
+    }
+    return await response.json() as unknown
+  } finally {
+    clearTimeout(timeout)
+    signal.removeEventListener("abort", abort)
+  }
+}
+
+/**
+ * Probes the provider site's public listing endpoints in order and returns the
+ * first recognized price set. Failure of individual endpoints is expected and
+ * silent; if none returns recognized prices the provider simply has no public
+ * pricing and nothing is displayed for it.
+ */
+export async function loadPublicPricing(
+  fetcher: typeof fetch,
+  signal: AbortSignal,
+  providerID: string,
+  site: string,
+): Promise<PublicSnapshot> {
+  for (const url of publicEndpointCandidates(site)) {
+    if (signal.aborted) throw new Error("public pricing refresh was aborted")
+    let payload: unknown
+    try {
+      payload = await requestPublicJSON(fetcher, url, signal)
+    } catch (error) {
+      if (signal.aborted) throw error
+      continue
+    }
+    const costs = parsePublicModels(payload)
+    if (costs.size === 0) continue
+    return { providerID, origin: url, state: "live", fetchedAt: Date.now(), costs }
+  }
+  throw new Error("no public pricing endpoint returned recognized prices")
+}
+
+/** Public prices fill only models that have no account-confirmed price. */
+export function withPublicPricing<T extends PricedModel>(
+  models: readonly T[],
+  publics: ReadonlyMap<string, PublicSnapshot>,
+): T[] {
+  if (publics.size === 0) return [...models]
+  return models.map((model) => {
+    if (model.priceState !== undefined) return model
+    const snapshot = publics.get(model.providerID)
+    const cost = snapshot?.costs.get(model.id)
+    if (!snapshot || !cost) return model
+    return {
+      ...model,
+      cost: cloneCost(cost.cost),
+      costCurrency: cost.currency,
+      priceState: snapshot.state === "live" ? "public" : "public-stale",
+    } as T
+  })
 }
 
 function capabilities(providerID: string): { pricing: boolean; balance: boolean; supported: boolean } {
