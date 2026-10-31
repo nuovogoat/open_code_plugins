@@ -35,7 +35,36 @@ opencode plugin add 'github:nuovogoat/open_code_plugins#opencode-model-autoroute
 
 История версий: [CHANGELOG.md](CHANGELOG.md).
 
-Для локальной разработки укажите каталог плагина в `opencode.jsonc` либо поместите его в `.opencode/plugins/` проекта или `~/.config/opencode/plugins/`. Не подключайте одновременно две копии с одинаковым ID.
+### Локальная установка
+
+Если `plugin add` не устанавливает git-пакет, скопируйте исходники в каталог плагинов OpenCode (то же, как `project-folder-tabs`):
+
+```powershell
+Copy-Item "C:\Tools\open_code_session_marker\opencode-model-autorouter\*" -Destination "C:\Users\Honor\.config\opencode\plugins\opencode-model-autorouter" -Recurse -Force
+# исключите node_modules и test-results
+opencode plugin list
+```
+
+После этого проверьте:
+```powershell
+opencode plugin list
+# ожидается: opencode-model-autorouter  local  C:\Users\Honor\.config\opencode\plugins\opencode-model-autorouter
+```
+
+### Обновление локальной копии
+
+Запустите скрипт синхронизации после любого изменения исходников:
+```powershell
+.\sync-opencode-plugin.ps1
+```
+Он копирует новые/изменённые файлы, удаляет из установленной копии то, чего нет в репозитории, и исключает `node_modules`, `test-results`. Затем проверьте `opencode plugin list`.
+
+⚠️ **Важно:** не подключайте git-пакет поверх локальной копии — два плагина с одинаковым ID (`opencode-model-autorouter`) конфликтуют. Сначала удалите локальную папку:
+```powershell
+Remove-Item "C:\Users\Honor\.config\opencode\plugins\opencode-model-autorouter" -Recurse -Force
+```
+
+Для локальной разработки укажите каталог плагина в `opencode.jsonc` либо поместите его в `.opencode/plugins/` проекта или `~/.config/opencode/plugins/`.
 
 ## Настройка
 
