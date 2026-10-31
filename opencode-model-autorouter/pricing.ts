@@ -477,7 +477,8 @@ export function extractProviderSite(provider: unknown): string | undefined {
 /**
  * Ordered endpoint candidates for public discovery. If the address already
  * points at a listing it is tried first; otherwise common OpenAI-compatible
- * listing paths are probed. At most five GET requests per provider per refresh.
+ * listing paths and the new-api family pricing path are probed. At most six
+ * GET requests per provider per refresh.
  */
 export function publicEndpointCandidates(site: string): string[] {
   const normalized = normalizeSiteURL(site)
@@ -491,17 +492,52 @@ export function publicEndpointCandidates(site: string): string[] {
   push(`${normalized}/api/v1/models`)
   push(`${normalized}/models`)
   push(`${normalized}/api/models`)
-  return list.slice(0, 5)
+  push(`${normalized}/api/pricing`)
+  return list.slice(0, 6)
+}
+
+/**
+ * new-api/one-api gateway public pricing (`GET /api/pricing`): `model_ratio`
+ * is priced in quota units per token with the one-api convention that 500000
+ * quota = $1, so USD per 1M input tokens = model_ratio × 2 and the output
+ * price is scaled by `completion_ratio`. The convention is verified empirically
+ * against the apimaster.ai public leaderboard (gpt-6-astra ratio 5 →
+ * $10/$50 per 1M, exactly as displayed by the site). Per-call priced models
+ * (`quota_type !== 0`) and rows without a positive token ratio have no
+ * confirmable per-token price and are skipped — nothing is invented.
+ */
+export function parseNewApiModels(payload: unknown): ReadonlyMap<string, AccountModelCost> {
+  const costs = new Map<string, AccountModelCost>()
+  const models = record(payload)?.data
+  if (!Array.isArray(models)) return costs
+  for (const value of models) {
+    const model = record(value)
+    if (typeof model?.model_name !== "string" || !model.model_name) continue
+    if ((number(model.quota_type) ?? 0) !== 0) continue
+    const ratio = number(model.model_ratio)
+    if (ratio === undefined || !(ratio > 0)) continue
+    const completion = number(model.completion_ratio)
+    const completionRatio = completion !== undefined && completion > 0 ? completion : 1
+    const input = ratio * 2
+    costs.set(model.model_name, {
+      currency: "USD",
+      cost: [{ input, output: input * completionRatio, cache: { read: 0, write: 0 } }],
+    })
+  }
+  return costs
 }
 
 /**
  * Public listings are recognized only in the OpenRouter-compatible shape
  * (`pricing.prompt`/`pricing.completion`, USD per token — the documented unit
- * of that format). A listing without recognized prices yields nothing; prices
- * in an unknown shape or unit are never invented.
+ * of that format) or the new-api/one-api shape (`model_ratio` quota units,
+ * see parseNewApiModels). A listing without recognized prices yields nothing;
+ * prices in an unknown shape or unit are never invented.
  */
 export function parsePublicModels(payload: unknown): ReadonlyMap<string, AccountModelCost> {
-  return parseOpenRouterModels(Array.isArray(payload) ? { data: payload } : payload)
+  const openrouter = parseOpenRouterModels(Array.isArray(payload) ? { data: payload } : payload)
+  if (openrouter.size > 0) return openrouter
+  return parseNewApiModels(payload)
 }
 
 async function requestPublicJSON(

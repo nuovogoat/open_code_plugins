@@ -7,6 +7,7 @@ import {
   loadPublicPricing,
   normalizeSiteURL,
   parseCbrDaily,
+  parseNewApiModels,
   parseOpenRouterCreditsBalance,
   parseOpenRouterKeyBalance,
   parseOpenRouterModels,
@@ -434,15 +435,16 @@ test("public pricing: endpoint candidates are ordered, capped and derived from t
     "https://p.example/api/v1/models",
     "https://p.example/models",
     "https://p.example/api/models",
+    "https://p.example/api/pricing",
   ])
   // An address that already points at a listing is probed first.
   assert.deepEqual(publicEndpointCandidates("https://p.example/v1/models")[0], "https://p.example/v1/models")
-  assert.equal(publicEndpointCandidates("https://p.example/v1/models").length, 5)
+  assert.equal(publicEndpointCandidates("https://p.example/v1/models").length, 6)
   assert.deepEqual(publicEndpointCandidates("javascript:alert(1)"), [])
   assert.deepEqual(publicEndpointCandidates(""), [])
 })
 
-test("public pricing: only the OpenRouter-compatible shape is recognized, nothing is invented", () => {
+test("public pricing: only recognized shapes are parsed, nothing is invented", () => {
   const costs = parsePublicModels({
     data: [{ id: "m", pricing: { prompt: "0.000001", completion: "0.000002" } }],
   })
@@ -455,12 +457,51 @@ test("public pricing: only the OpenRouter-compatible shape is recognized, nothin
     parsePublicModels([{ id: "m", pricing: { prompt: 1e-6, completion: 2e-6 } }]).size,
     1,
   )
+  // The new-api/one-api shape (`/api/pricing`) is recognized as well.
+  const newApi = parsePublicModels({
+    data: [{ model_name: "qwen3.8-max", quota_type: 0, model_ratio: 1, completion_ratio: 3 }],
+  })
+  assert.deepEqual(newApi.get("qwen3.8-max"), {
+    currency: "USD",
+    cost: [{ input: 2, output: 6, cache: { read: 0, write: 0 } }],
+  })
   // A plain OpenAI listing without prices yields nothing: no price is guessed.
   assert.equal(parsePublicModels({ data: [{ id: "m", object: "model", owned_by: "x" }] }).size, 0)
   // Unknown units/currencies are not interpreted.
   assert.equal(parsePublicModels({ data: [{ id: "m", cost: { input: 5, output: 9, currency: "RUB" } }] }).size, 0)
   for (const garbage of [null, undefined, 0, "", "text", [], {}, { data: "x" }, { data: [null, 1, "s"] }]) {
     assert.equal(parsePublicModels(garbage).size, 0)
+  }
+})
+
+test("public pricing: new-api ratios convert by the 500000 quota = $1 convention, per-call models are skipped", () => {
+  const costs = parseNewApiModels({
+    data: [
+      // Verified against apimaster.ai public leaderboard: ratio 5 → $10/$50 per 1M.
+      { model_name: "gpt-6-astra", quota_type: 0, model_ratio: 5, completion_ratio: 5 },
+      // Missing completion_ratio defaults to 1 (output = input).
+      { model_name: "solo", quota_type: 0, model_ratio: 0.75 },
+      // Per-call billing: no confirmable per-token price → skipped.
+      { model_name: "image-model", quota_type: 1, model_price: 0.2, model_ratio: 0 },
+      // Zero, negative, and non-numeric ratios are skipped.
+      { model_name: "zero", quota_type: 0, model_ratio: 0 },
+      { model_name: "negative", quota_type: 0, model_ratio: -1 },
+      { model_name: "nan", quota_type: 0, model_ratio: "cheap" },
+      { model_name: "", quota_type: 0, model_ratio: 1 },
+      { quota_type: 0, model_ratio: 1 },
+    ],
+  })
+  assert.deepEqual([...costs.keys()], ["gpt-6-astra", "solo"])
+  assert.deepEqual(costs.get("gpt-6-astra"), {
+    currency: "USD",
+    cost: [{ input: 10, output: 50, cache: { read: 0, write: 0 } }],
+  })
+  assert.deepEqual(costs.get("solo"), {
+    currency: "USD",
+    cost: [{ input: 1.5, output: 1.5, cache: { read: 0, write: 0 } }],
+  })
+  for (const garbage of [null, undefined, 0, "text", {}, { data: "x" }, { data: [null, 1] }]) {
+    assert.equal(parseNewApiModels(garbage).size, 0)
   }
 })
 
@@ -544,6 +585,42 @@ test("public pricing: the loader probes in order, stays anonymous and fails clea
   const aborted = new AbortController()
   aborted.abort()
   await assert.rejects(loadPublicPricing(jsonFetcher({}, []), aborted.signal, "p", "https://p.example"))
+})
+
+test("public pricing: a new-api gateway is recognized via /api/pricing after unpriced listings", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const snapshot = await loadPublicPricing(
+    jsonFetcher(
+      {
+        // A real OpenAI-compatible listing without prices is not a price source.
+        "https://gw.example/v1/models": {
+          body: { data: [{ id: "qwen3.8-max", object: "model", owned_by: "custom" }] },
+        },
+        "https://gw.example/api/pricing": {
+          body: { data: [{ model_name: "qwen3.8-max", quota_type: 0, model_ratio: 1, completion_ratio: 3 }] },
+        },
+      },
+      requests,
+    ),
+    new AbortController().signal,
+    "gw",
+    "https://gw.example",
+  )
+  assert.equal(snapshot.origin, "https://gw.example/api/pricing")
+  assert.equal(snapshot.state, "live")
+  assert.deepEqual(snapshot.costs.get("qwen3.8-max"), {
+    currency: "USD",
+    cost: [{ input: 2, output: 6, cache: { read: 0, write: 0 } }],
+  })
+  // All four listing paths are probed before the pricing path; every request stays anonymous.
+  assert.equal(requests.length, 5)
+  for (const request of requests) {
+    const headers = new Headers(request.init?.headers)
+    assert.equal(headers.get("authorization"), null)
+    assert.equal(headers.get("cookie"), null)
+    assert.equal(request.init?.credentials, "omit")
+    assert.equal(request.init?.redirect, "error")
+  }
 })
 
 test("public pricing: a hanging endpoint is aborted, not awaited forever", async () => {
