@@ -74,6 +74,8 @@ const model = {
     name: { type: "string" },
     enabled: { type: "boolean" },
     routingEnabled: { type: "boolean" },
+    priceLimitBreached: { type: "boolean" },
+    thresholdExcluded: { type: "boolean" },
     costCurrency: { type: "string" },
     priceState: { type: "string", enum: ["live", "stale"] },
     variants: { type: "array", items: { type: "string" } },
@@ -109,6 +111,34 @@ const model = {
   additionalProperties: false,
 } as const
 
+const accountThresholds = {
+  type: "object",
+  additionalProperties: {
+    type: "object",
+    properties: {
+      minBalance: { type: "number", minimum: 0 },
+      action: { type: "string", enum: ["warn", "exclude"] },
+    },
+    additionalProperties: false,
+  },
+} as const
+
+/** Global per-currency price bounds; keyed by the account price currency. */
+const priceLimits = {
+  type: "object",
+  additionalProperties: {
+    type: "object",
+    properties: {
+      inputMin: { type: "number", minimum: 0 },
+      inputMax: { type: "number", minimum: 0 },
+      outputMin: { type: "number", minimum: 0 },
+      outputMax: { type: "number", minimum: 0 },
+      action: { type: "string", enum: ["warn", "exclude"] },
+    },
+    additionalProperties: false,
+  },
+} as const
+
 const status = {
   type: "object",
   properties: {
@@ -120,6 +150,20 @@ const status = {
     cooldownMs: { type: "number" },
     metricAlpha: { type: "number" },
     rescanIntervalMs: { type: "number" },
+    accountThresholds,
+    priceLimits,
+    cbrOrientation: { type: "boolean" },
+    cbr: {
+      type: "object",
+      properties: {
+        date: { type: "string" },
+        fetchedAt: { type: "string" },
+        stale: { type: "boolean" },
+        rates: { type: "object", additionalProperties: { type: "number" } },
+      },
+      required: ["date", "fetchedAt", "stale", "rates"],
+      additionalProperties: false,
+    },
     accounts: {
       type: "array",
       items: {
@@ -133,6 +177,7 @@ const status = {
           matchedModels: { type: "number" },
           balance: { type: "number" },
           balanceCurrency: { type: "string" },
+          lowBalance: { type: "boolean" },
           keySource: { type: "string", enum: ["plugin", "opencode"] },
           pluginKey: { type: "boolean" },
         },
@@ -179,6 +224,9 @@ const status = {
     "cooldownMs",
     "metricAlpha",
     "rescanIntervalMs",
+    "accountThresholds",
+    "priceLimits",
+    "cbrOrientation",
     "accounts",
     "disabledModels",
     "manualGroups",
@@ -229,6 +277,9 @@ const configure = {
     cooldownMs: { type: "number" },
     metricAlpha: { type: "number" },
     rescanIntervalMs: { type: "number" },
+    accountThresholds,
+    priceLimits,
+    cbrOrientation: { type: "boolean" },
     reset: { type: "boolean" },
   },
   additionalProperties: false,

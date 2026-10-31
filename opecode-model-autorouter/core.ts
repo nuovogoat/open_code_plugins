@@ -1,9 +1,11 @@
 import {
   loadAccountSnapshots,
+  loadCbrRates,
   withAccountPricing,
   type AccountKey,
   type AccountProvider,
   type AccountSnapshot,
+  type CbrRates,
   type ModelCost,
 } from "./pricing.ts"
 import { openAccountVault, VAULT_PROVIDERS, type AccountVault } from "./vault.ts"
@@ -40,6 +42,26 @@ interface GroupOptions {
   strategy?: Strategy
 }
 
+export interface AccountThreshold {
+  /** Minimum acceptable account balance, in the account's own currency. */
+  minBalance?: number
+  /** "warn" only marks values; "exclude" also removes affected models from routing. */
+  action?: "warn" | "exclude"
+}
+
+export interface PriceLimits {
+  /** Lower bound for the first-tier input price per 1M, in the price currency. */
+  inputMin?: number
+  /** Upper bound for the first-tier input price per 1M, in the price currency. */
+  inputMax?: number
+  /** Lower bound for the first-tier output price per 1M, in the price currency. */
+  outputMin?: number
+  /** Upper bound for the first-tier output price per 1M, in the price currency. */
+  outputMax?: number
+  /** "warn" only marks values; "exclude" also removes affected models from routing. */
+  action?: "warn" | "exclude"
+}
+
 export interface RouterOptions {
   enabled?: boolean
   autoDiscover?: boolean
@@ -51,6 +73,10 @@ export interface RouterOptions {
   resumeAfterFailover?: boolean
   metricAlpha?: number
   rescanIntervalMs?: number
+  accountThresholds?: Record<string, AccountThreshold>
+  /** Price bounds keyed by price currency; applied to every confirmed account price. */
+  priceLimits?: Record<string, PriceLimits>
+  cbrOrientation?: boolean
 }
 
 export interface Candidate extends ModelRef {
@@ -131,6 +157,10 @@ export interface PluginContext {
 
 const STRATEGIES = new Set<Strategy>(["free-fastest", "fastest", "cheapest", "manual"])
 const STORAGE_KEY = "router-options-v1"
+/** Display-only ЦБ РФ orientation: cached rates stay fresh for ~6 hours. */
+const CBR_TTL_MS = 6 * 60 * 60_000
+/** After a failed fetch the next attempt waits ~15 minutes; stale rates keep their date. */
+const CBR_RETRY_MS = 15 * 60_000
 const CONTINUE_TEXT =
   "The previous model provider became unavailable. Continue the existing task using the conversation and tool results already present. Do not repeat completed side effects."
 const EVENT_TYPES = [
@@ -199,7 +229,7 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   const input = value as Record<string, unknown>
   const result: RouterOptions = {}
-  for (const key of ["enabled", "autoDiscover", "resumeAfterFailover"] as const) {
+  for (const key of ["enabled", "autoDiscover", "resumeAfterFailover", "cbrOrientation"] as const) {
     if (typeof input[key] === "boolean") result[key] = input[key]
   }
   if (STRATEGIES.has(input.strategy as Strategy)) result.strategy = input.strategy as Strategy
@@ -240,6 +270,68 @@ export function normalizeRouterOptions(value: unknown): RouterOptions {
       }
     }
     result.groups = groups
+  }
+  if (
+    input.accountThresholds &&
+    typeof input.accountThresholds === "object" &&
+    !Array.isArray(input.accountThresholds)
+  ) {
+    const thresholds: Record<string, AccountThreshold> = {}
+    for (const [rawProvider, value] of Object.entries(input.accountThresholds).slice(0, 100)) {
+      const providerID = rawProvider.trim().slice(0, 80)
+      if (!providerID || !value || typeof value !== "object" || Array.isArray(value)) continue
+      const entry = value as Record<string, unknown>
+      const threshold: AccountThreshold = {}
+      if (
+        typeof entry.minBalance === "number" &&
+        Number.isFinite(entry.minBalance) &&
+        entry.minBalance >= 0
+      ) {
+        threshold.minBalance = entry.minBalance
+      }
+      if (entry.action === "warn" || entry.action === "exclude") threshold.action = entry.action
+      // Entries without at least one value are dropped, so configure can clear them.
+      if (threshold.minBalance !== undefined) {
+        thresholds[providerID] = threshold
+      }
+    }
+    result.accountThresholds = thresholds
+  }
+  if (
+    input.priceLimits &&
+    typeof input.priceLimits === "object" &&
+    !Array.isArray(input.priceLimits)
+  ) {
+    const limits: Record<string, PriceLimits> = {}
+    for (const [rawCurrency, value] of Object.entries(input.priceLimits).slice(0, 50)) {
+      const currency = rawCurrency.trim().toUpperCase().slice(0, 3)
+      if (
+        !/^[A-Z]{3}$/u.test(currency) ||
+        !value ||
+        typeof value !== "object" ||
+        Array.isArray(value)
+      ) {
+        continue
+      }
+      const entry = value as Record<string, unknown>
+      const bound: PriceLimits = {}
+      for (const key of ["inputMin", "inputMax", "outputMin", "outputMax"] as const) {
+        if (typeof entry[key] === "number" && Number.isFinite(entry[key]) && entry[key] >= 0) {
+          bound[key] = entry[key]
+        }
+      }
+      if (entry.action === "warn" || entry.action === "exclude") bound.action = entry.action
+      // Entries without at least one bound are dropped, so configure can clear them.
+      if (
+        bound.inputMin !== undefined ||
+        bound.inputMax !== undefined ||
+        bound.outputMin !== undefined ||
+        bound.outputMax !== undefined
+      ) {
+        limits[currency] = bound
+      }
+    }
+    result.priceLimits = limits
   }
   return result
 }
@@ -298,6 +390,62 @@ function candidateCost(candidate: Candidate, metrics: ReadonlyMap<string, ModelM
   return catalog
 }
 
+export interface ThresholdEvaluation {
+  /** Providers whose confirmed balance dropped below the configured minimum. */
+  lowBalance: Set<string>
+  /** "providerID/modelID" keys whose confirmed account price is outside configured limits. */
+  priceBreached: Set<string>
+  /** Keys removed from routing while the matching action is "exclude"; restored automatically. */
+  excluded: Set<string>
+}
+
+/**
+ * Guardrails are compared only against values confirmed by account APIs and
+ * only within a single currency: balance thresholds use the account currency,
+ * price limits are keyed by the price currency and apply to every provider.
+ * Models without a confirmed account price are never flagged or excluded,
+ * and nothing is converted by an assumed exchange rate.
+ */
+export function evaluateGuardrails(
+  models: readonly ModelInfo[],
+  accounts: ReadonlyMap<string, AccountSnapshot>,
+  accountThresholds: Record<string, AccountThreshold> = {},
+  priceLimits: Record<string, PriceLimits> = {},
+): ThresholdEvaluation {
+  const lowBalance = new Set<string>()
+  const priceBreached = new Set<string>()
+  const excluded = new Set<string>()
+  for (const [providerID, threshold] of Object.entries(accountThresholds)) {
+    const snapshot = accounts.get(providerID)
+    const balance = snapshot?.balance
+    // Without a confirmed balance in a known currency the threshold has no meaning.
+    if (!balance || threshold.minBalance === undefined) continue
+    if (balance.amount >= threshold.minBalance) continue
+    lowBalance.add(providerID)
+    if (threshold.action !== "exclude") continue
+    for (const model of models) {
+      if (model.providerID === providerID) excluded.add(`${model.providerID}/${model.id}`)
+    }
+  }
+  for (const model of models) {
+    // Only account-confirmed prices participate; unknown prices are never guessed.
+    if (model.priceState === undefined) continue
+    const tier = model.cost?.[0]
+    const limits = tier ? priceLimits[model.costCurrency ?? "USD"] : undefined
+    if (!tier || !limits) continue
+    const breached =
+      (limits.inputMax !== undefined && tier.input > limits.inputMax) ||
+      (limits.outputMax !== undefined && tier.output > limits.outputMax) ||
+      (limits.inputMin !== undefined && tier.input < limits.inputMin) ||
+      (limits.outputMin !== undefined && tier.output < limits.outputMin)
+    if (!breached) continue
+    const key = `${model.providerID}/${model.id}`
+    priceBreached.add(key)
+    if (limits.action === "exclude") excluded.add(key)
+  }
+  return { lowBalance, priceBreached, excluded }
+}
+
 export function isLimitError(error: any): boolean {
   const status = error?.status
   if (status === 402 || status === 429) return true
@@ -319,12 +467,17 @@ function retryAfterMs(error: any, fallback: number): number {
 export function buildRouteGroups(
   models: ModelInfo[],
   options: RouterOptions = {},
+  extraDisabled: ReadonlySet<string> = new Set(),
 ): Map<string, RouteGroup> {
   const result = new Map<string, RouteGroup>()
   const defaultStrategy = strategy(options.strategy, "free-fastest")
   const disabled = new Set(options.disabledModels ?? [])
   const enabled = models.filter((model) => model.enabled !== false)
-  const locallyDisabled = (model: ModelRef) => disabled.has(`${model.providerID}/${model.id}`)
+  // Threshold exclusions behave like local disables: lookup keeps them, selection never does.
+  const locallyDisabled = (model: ModelRef) => {
+    const key = `${model.providerID}/${model.id}`
+    return disabled.has(key) || extraDisabled.has(key)
+  }
 
   if (options.autoDiscover !== false) {
     const buckets = new Map<string, ModelInfo[]>()
@@ -467,6 +620,13 @@ export class ModelAutoRouter {
   private catalogModels: ModelInfo[] = []
   private models: ModelInfo[] = []
   private accounts: ReadonlyMap<string, AccountSnapshot> = new Map()
+  private thresholds: ThresholdEvaluation = {
+    lowBalance: new Set(),
+    priceBreached: new Set(),
+    excluded: new Set(),
+  }
+  private cbr: CbrRates | undefined
+  private cbrFailedAt = 0
   private vault: AccountVault | undefined
   private vaultProviders = new Set<string>()
   private refreshing: Promise<void> | undefined
@@ -537,7 +697,7 @@ export class ModelAutoRouter {
       this.replaceOptions(next)
       if (next.enabled === false || next.resumeAfterFailover === false) this.pending.clear()
       this.models = withAccountPricing(this.catalogModels, this.accounts)
-      this.groups = buildRouteGroups(this.models, this.options)
+      this.rebuildGroups()
       this.scheduleRescan()
       await this.refresh()
       return this.status()
@@ -648,6 +808,37 @@ export class ModelAutoRouter {
     }
   }
 
+  /** Threshold evaluation is recomputed from live account data on every rebuild. */
+  private rebuildGroups(): void {
+    this.thresholds = evaluateGuardrails(
+      this.models,
+      this.accounts,
+      this.options.accountThresholds,
+      this.options.priceLimits,
+    )
+    this.groups = buildRouteGroups(this.models, this.options, this.thresholds.excluded)
+  }
+
+  /** Opt-in display orientation; ЦБ РФ rates never influence routing or selection. */
+  private async updateCbr(): Promise<void> {
+    if (this.options.cbrOrientation !== true) {
+      this.cbr = undefined
+      this.cbrFailedAt = 0
+      return
+    }
+    const now = Date.now()
+    if (this.cbr && now - this.cbr.fetchedAt < CBR_TTL_MS) return
+    if (this.cbrFailedAt && now - this.cbrFailedAt < CBR_RETRY_MS) return
+    try {
+      const rates = await loadCbrRates(globalThis.fetch, this.lifecycle.signal)
+      if (!this.stopped) this.cbr = rates
+    } catch {
+      if (this.stopped || this.lifecycle.signal.aborted) return
+      this.cbrFailedAt = Date.now()
+      // Previous rates stay with their published date; the status marks them stale.
+    }
+  }
+
   async refresh(): Promise<void> {
     if (this.refreshing) return this.refreshing
     this.refreshing = (async () => {
@@ -655,12 +846,13 @@ export class ModelAutoRouter {
       const [listed] = await Promise.allSettled([
         this.ctx.model.list({ types: ["chat"] }),
         this.updateAccounts(),
+        this.updateCbr(),
       ])
       if (this.stopped) return
       if (listed.status === "fulfilled") this.catalogModels = listed.value.data
       else this.report("model scan failed")
       this.models = withAccountPricing(this.catalogModels, this.accounts)
-      this.groups = buildRouteGroups(this.models, this.options)
+      this.rebuildGroups()
       this.refreshing = undefined
     })().finally(() => {
       this.refreshing = undefined
@@ -974,6 +1166,36 @@ export class ModelAutoRouter {
       cooldownMs: positiveNumber(this.options.cooldownMs, 60_000),
       metricAlpha: this.alpha(),
       rescanIntervalMs: positiveNumber(this.options.rescanIntervalMs, 60_000),
+      accountThresholds: Object.fromEntries(
+        Object.entries(this.options.accountThresholds ?? {}).map(([providerID, threshold]) => [
+          providerID,
+          defined({
+            minBalance: threshold.minBalance,
+            action: threshold.action,
+          }),
+        ]),
+      ),
+      priceLimits: Object.fromEntries(
+        Object.entries(this.options.priceLimits ?? {}).map(([currency, bound]) => [
+          currency,
+          defined({
+            inputMin: bound.inputMin,
+            inputMax: bound.inputMax,
+            outputMin: bound.outputMin,
+            outputMax: bound.outputMax,
+            action: bound.action,
+          }),
+        ]),
+      ),
+      cbrOrientation: this.options.cbrOrientation === true,
+      cbr: this.cbr
+        ? {
+            date: this.cbr.date,
+            fetchedAt: new Date(this.cbr.fetchedAt).toISOString(),
+            stale: now - this.cbr.fetchedAt > CBR_TTL_MS,
+            rates: { ...this.cbr.rates },
+          }
+        : undefined,
       accounts: [...this.accounts.values()].map((snapshot) => {
         const matched = this.models.filter(
           (model) => model.providerID === snapshot.providerID && model.priceState !== undefined,
@@ -989,6 +1211,7 @@ export class ModelAutoRouter {
           matchedModels: matched,
           balance: snapshot.balance?.amount,
           balanceCurrency: snapshot.balance?.currency,
+          lowBalance: this.thresholds.lowBalance.has(snapshot.providerID) || undefined,
           keySource: snapshot.keySource,
           pluginKey: this.vaultProviders.has(snapshot.providerID) || undefined,
         })
@@ -1013,6 +1236,8 @@ export class ModelAutoRouter {
           name: info.name,
           enabled: info.enabled !== false,
           routingEnabled: info.enabled !== false && !disabled.has(key),
+          priceLimitBreached: this.thresholds.priceBreached.has(key) || undefined,
+          thresholdExcluded: this.thresholds.excluded.has(key) || undefined,
           variants: info.variants?.map((variant) => variant.id) ?? [],
           costCurrency: info.costCurrency,
           priceState: info.priceState,
@@ -1135,7 +1360,8 @@ export class ModelAutoRouter {
                     item.providerID === ref.providerID &&
                     item.id === ref.id &&
                     item.enabled !== false &&
-                    !this.options.disabledModels?.includes(`${item.providerID}/${item.id}`),
+                    !this.options.disabledModels?.includes(`${item.providerID}/${item.id}`) &&
+                    !this.thresholds.excluded.has(`${item.providerID}/${item.id}`),
                 )
               : undefined
             const candidate: Candidate | undefined = grouped
@@ -1173,6 +1399,8 @@ export class ModelAutoRouter {
     this.activity.clear()
     this.failedExecutions.clear()
     this.cooldowns.clear()
+    this.cbr = undefined
+    this.cbrFailedAt = 0
     this.vault = undefined
     this.vaultProviders.clear()
   }

@@ -89,6 +89,16 @@
 .mar-key-form { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; padding: 12px; border: 1px solid var(--mar-border); border-radius: 8px; }
 .mar-key-input { flex: 1 1 240px; min-width: 0; max-width: 420px; }
 .mar-key-form .mar-help { flex-basis: 100%; }
+.mar-threshold-form { align-items: flex-end; }
+.mar-threshold-field { display: flex; flex-direction: column; gap: 4px; color: var(--mar-muted); font-size: 11px; }
+.mar-threshold-field .mar-number { width: 150px; }
+.mar-threshold-field .mar-select { max-width: 280px; }
+.mar-price-limit-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--mar-border); }
+.mar-price-limit-row:last-of-type { border-bottom: none; }
+.mar-price-limit-currency { min-width: 48px; font-weight: 600; }
+.mar-price-limit-row .mar-number { width: 110px; }
+.mar-account-note { flex-basis: 100%; color: var(--mar-muted); font-size: 10px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.mar-orientation { display: block; margin-top: 2px; color: var(--mar-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .mar-group-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
 .mar-group-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--mar-border); border-radius: 8px; }
 .mar-group-card-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

@@ -32,12 +32,41 @@ export interface CatalogModel {
   }>
   limit?: { context?: number; output?: number }
   capabilities?: { tools?: boolean; input?: string[]; output?: string[] }
+  priceLimitBreached?: boolean
+  thresholdExcluded?: boolean
 }
 
 export interface ManualGroup {
   name: string
   strategy: Strategy
   models: string[]
+}
+
+export interface AccountThreshold {
+  minBalance?: number
+  action?: "warn" | "exclude"
+}
+
+/**
+ * Global price bounds keyed by the account price currency (e.g. "USD", "RUB").
+ * They apply to every model with a confirmed account price in that currency
+ * across all providers; values in different currencies never mix.
+ */
+export interface PriceLimits {
+  inputMin?: number
+  inputMax?: number
+  outputMin?: number
+  outputMax?: number
+  action?: "warn" | "exclude"
+}
+
+export interface CbrInfo {
+  /** Rate date exactly as published by the ЦБ РФ feed (DD.MM.YYYY). */
+  date: string
+  fetchedAt: string
+  stale: boolean
+  /** Rubles per one unit; RUB itself is always 1. */
+  rates: Record<string, number>
 }
 
 /**
@@ -57,6 +86,7 @@ export interface AccountInfo {
   matchedModels: number
   balance?: number
   balanceCurrency?: string
+  lowBalance?: boolean
   keySource?: "plugin" | "opencode"
   pluginKey?: boolean
 }
@@ -70,6 +100,10 @@ export interface RouterStatus {
   cooldownMs: number
   metricAlpha: number
   rescanIntervalMs: number
+  accountThresholds: Record<string, AccountThreshold>
+  priceLimits: Record<string, PriceLimits>
+  cbrOrientation: boolean
+  cbr?: CbrInfo
   accounts: AccountInfo[]
   disabledModels: string[]
   manualGroups: ManualGroup[]
@@ -118,6 +152,48 @@ export function formatBalance(amount: number | undefined, currency: string | und
   const formatted = amount.toLocaleString("ru-RU", { maximumFractionDigits: 2 })
   const symbol = currency ? CURRENCY_SYMBOLS[currency] : undefined
   return symbol ? `${formatted} ${symbol}` : `${formatted}${currency ? ` ${currency}` : ""}`
+}
+
+/**
+ * Cross-rate between two currencies via the RUB base of the ЦБ РФ feed.
+ * Display-only orientation: a missing rate yields undefined and the value is
+ * never shown, and routing code never converts currencies.
+ */
+export function cbrCross(
+  rates: Record<string, number> | undefined,
+  from: string | undefined,
+  to: string | undefined,
+): number | undefined {
+  if (!from || !to) return undefined
+  if (from === to) return 1
+  const base = rates?.[from]
+  const quote = rates?.[to]
+  if (!base || !quote || !Number.isFinite(base) || !Number.isFinite(quote)) return undefined
+  return base / quote
+}
+
+export function cbrConvert(
+  rates: Record<string, number> | undefined,
+  amount: number | undefined,
+  from: string | undefined,
+  to: string | undefined,
+): number | undefined {
+  if (amount === undefined || !Number.isFinite(amount)) return undefined
+  const rate = cbrCross(rates, from, to)
+  return rate === undefined ? undefined : amount * rate
+}
+
+/** All currencies in which account balances and confirmed prices are presented. */
+export function accountCurrencies(status: Pick<RouterStatus, "accounts" | "models">): string[] {
+  const currencies = new Set<string>()
+  for (const account of status.accounts) {
+    if (account.balance !== undefined && account.balanceCurrency) currencies.add(account.balanceCurrency)
+  }
+  for (const model of status.models) {
+    const unit = priceCurrency(model)
+    if (unit && Number.isFinite(catalogPrice(model))) currencies.add(unit)
+  }
+  return [...currencies].sort()
 }
 
 export function formatSpeed(value: number | undefined): string {

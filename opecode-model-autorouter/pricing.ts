@@ -334,6 +334,87 @@ async function plusVibe(
   }
 }
 
+export interface CbrRates {
+  /** Rate date exactly as published by the ЦБ РФ feed (DD.MM.YYYY). */
+  date: string
+  /** Rubles per one unit of each currency; RUB itself is always 1. */
+  rates: Record<string, number>
+  fetchedAt: number
+}
+
+/** Official ЦБ РФ daily feed; the windows-1251 body carries the rate date as published. */
+const CBR_API = "https://www.cbr.ru/scripts/XML_daily.asp"
+
+function tagText(block: string, tag: string): string | undefined {
+  const match = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "iu"))
+  return match?.[1].trim()
+}
+
+function cbrNumber(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  // The feed uses a comma decimal separator and may contain non-breaking spaces.
+  const parsed = Number(value.replace(/[\s\u00a0]/gu, "").replace(",", "."))
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+/**
+ * ЦБ РФ daily XML → RUB-based rates, parsed without dependencies. Only ASCII
+ * char codes and digits are used, so the windows-1251 encoding of the feed
+ * cannot corrupt them. Unrecognized entries are skipped, never invented.
+ */
+export function parseCbrDaily(xml: string): Omit<CbrRates, "fetchedAt"> | undefined {
+  if (typeof xml !== "string") return undefined
+  const date = xml.match(/<ValCurs[^>]*\bDate="(\d{2}\.\d{2}\.\d{4})"/iu)?.[1]
+  if (!date) return undefined
+  const rates: Record<string, number> = { RUB: 1 }
+  for (const block of xml.matchAll(/<Valute\b[^>]*>([\s\S]*?)<\/Valute>/giu)) {
+    const body = block[1]
+    const code = tagText(body, "CharCode")
+    if (!code || !/^[A-Za-z]{3}$/u.test(code)) continue
+    // VunitRate is already per one unit; Value covers Nominal units.
+    const unitRate = cbrNumber(tagText(body, "VunitRate"))
+    const nominal = cbrNumber(tagText(body, "Nominal")) ?? 1
+    const value = cbrNumber(tagText(body, "Value"))
+    const rate = unitRate ?? (value !== undefined ? value / nominal : undefined)
+    if (rate === undefined) continue
+    rates[code.toUpperCase()] = rate
+  }
+  // A feed without any recognized currency is not a rate source.
+  return Object.keys(rates).length > 1 ? { date, rates } : undefined
+}
+
+/**
+ * Display-only orientation source: the hardcoded public ЦБ РФ origin is called
+ * without credentials and with the same guardrails as the account APIs.
+ */
+export async function loadCbrRates(fetcher: typeof fetch, signal: AbortSignal): Promise<CbrRates> {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  const timeout = setTimeout(() => controller.abort(), 15_000)
+  timeout.unref?.()
+  if (signal.aborted) abort()
+  else signal.addEventListener("abort", abort, { once: true })
+  try {
+    const response = await fetcher(CBR_API, {
+      headers: { accept: "text/xml, application/xml, text/plain" },
+      cache: "no-cache",
+      redirect: "error",
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(`exchange-rate API returned HTTP ${response.status}`)
+    const length = Number(response.headers.get("content-length"))
+    if (Number.isFinite(length) && length > 4 * 1024 * 1024) {
+      throw new Error("exchange-rate response is too large")
+    }
+    const parsed = parseCbrDaily(await response.text())
+    if (!parsed) throw new Error("exchange-rate feed is not recognized")
+    return { ...parsed, fetchedAt: Date.now() }
+  } finally {
+    clearTimeout(timeout)
+    signal.removeEventListener("abort", abort)
+  }
+}
+
 function capabilities(providerID: string): { pricing: boolean; balance: boolean; supported: boolean } {
   switch (providerID) {
     case "openrouter":

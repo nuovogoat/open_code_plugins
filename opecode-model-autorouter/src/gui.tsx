@@ -3,16 +3,21 @@ import { For, Show, createMemo, createSignal, onCleanup } from "solid-js"
 import { ModelAutoRouterRpc } from "../rpc.ts"
 import {
   VAULT_PROVIDER_IDS,
+  accountCurrencies,
   catalogPrice,
+  cbrConvert,
   formatBalance,
   formatLatency,
   formatPrice,
   formatSpeed,
   organizeModels,
   priceCurrency,
+  type AccountInfo,
+  type AccountThreshold,
   type CatalogModel,
   type Grouping,
   type ManualGroup,
+  type PriceLimits,
   type RouterStatus,
   type Sorting,
   type Strategy,
@@ -31,7 +36,19 @@ interface ConfigurePatch {
   cooldownMs?: number
   metricAlpha?: number
   rescanIntervalMs?: number
+  accountThresholds?: Record<string, AccountThreshold>
+  priceLimits?: Record<string, PriceLimits>
+  cbrOrientation?: boolean
   reset?: boolean
+}
+
+/** Per-currency price-bound drafts; empty strings mean "not set". */
+interface PriceLimitDraft {
+  inputMin: string
+  inputMax: string
+  outputMin: string
+  outputMax: string
+  action: "warn" | "exclude"
 }
 
 interface RouterOptions {
@@ -91,6 +108,10 @@ export default Plugin.define({
       const [groupSearch, setGroupSearch] = createSignal("")
       const [keyProvider, setKeyProvider] = createSignal("")
       const [keyDraft, setKeyDraft] = createSignal("")
+      const [thresholdProvider, setThresholdProvider] = createSignal("")
+      const [thresholdMin, setThresholdMin] = createSignal("")
+      const [thresholdAction, setThresholdAction] = createSignal<"warn" | "exclude">("warn")
+      const [priceDrafts, setPriceDrafts] = createSignal<Record<string, PriceLimitDraft>>({})
 
       const selectedSession = () => {
         const sessions = ctx.sessions.list()
@@ -246,6 +267,126 @@ export default Plugin.define({
         )
       }
 
+      const orientationCurrencies = createMemo(() =>
+        status()?.cbr ? accountCurrencies(status()!) : [],
+      )
+      const orientationTitle = () =>
+        `Приблизительно по курсу ЦБ РФ на ${status()?.cbr?.date ?? "—"}; не используется для маршрутизации`
+      const orientation = (amount: number | undefined, from: string | undefined) => {
+        const rates = status()?.cbr?.rates
+        if (!rates || amount === undefined) return []
+        return orientationCurrencies()
+          .filter((unit) => unit !== from)
+          .map((unit) => ({ unit, value: cbrConvert(rates, amount, from, unit) }))
+          .filter((item): item is { unit: string; value: number } => item.value !== undefined)
+      }
+      const priceOrientation = (model: CatalogModel) => {
+        const price = catalogPrice(model)
+        return Number.isFinite(price) ? orientation(price, priceCurrency(model)) : []
+      }
+      const thresholdCurrencyLabel = () => {
+        const account = status()?.accounts.find((item) => item.providerID === thresholdProvider())
+        return account?.balanceCurrency ?? "валюта аккаунта"
+      }
+      const thresholdSummary = (account: AccountInfo) => {
+        const threshold = status()?.accountThresholds?.[account.providerID]
+        if (!threshold) return ""
+        const parts: string[] = []
+        if (threshold.minBalance !== undefined) {
+          parts.push(`мин. остаток ${formatBalance(threshold.minBalance, account.balanceCurrency)}`)
+        }
+        parts.push(threshold.action === "exclude" ? "исключать из роутинга" : "только предупреждать")
+        return parts.join(" · ")
+      }
+      const openThresholdForm = (account: AccountInfo) => {
+        const existing = status()?.accountThresholds?.[account.providerID]
+        setThresholdProvider(account.providerID)
+        setThresholdMin(existing?.minBalance !== undefined ? String(existing.minBalance) : "")
+        setThresholdAction(existing?.action === "exclude" ? "exclude" : "warn")
+      }
+      const saveThreshold = async () => {
+        const providerID = thresholdProvider()
+        if (!providerID) return
+        const minValue = thresholdMin().trim() === "" ? undefined : Number(thresholdMin())
+        if (minValue !== undefined && (!Number.isFinite(minValue) || minValue < 0)) {
+          setLocalError("Минимальный остаток должен быть неотрицательным числом")
+          return
+        }
+        const thresholds: Record<string, AccountThreshold> = { ...(status()?.accountThresholds ?? {}) }
+        if (minValue === undefined) delete thresholds[providerID]
+        else thresholds[providerID] = { minBalance: minValue, action: thresholdAction() }
+        const saved = await configure(
+          { accountThresholds: thresholds },
+          minValue === undefined
+            ? `Пороги ${providerID} удалены`
+            : `Пороги ${providerID} сохранены`,
+        )
+        if (saved) setThresholdProvider("")
+      }
+
+      /** Currencies with confirmed account prices, plus any already configured bounds. */
+      const limitCurrencies = createMemo(() => {
+        const current = status()
+        if (!current) return []
+        return [
+          ...new Set([
+            ...Object.keys(current.priceLimits ?? {}),
+            ...accountCurrencies(current),
+          ]),
+        ].sort()
+      })
+      const priceDraft = (currency: string): PriceLimitDraft => {
+        const draft = priceDrafts()[currency]
+        if (draft) return draft
+        const bound = status()?.priceLimits?.[currency]
+        return {
+          inputMin: bound?.inputMin !== undefined ? String(bound.inputMin) : "",
+          inputMax: bound?.inputMax !== undefined ? String(bound.inputMax) : "",
+          outputMin: bound?.outputMin !== undefined ? String(bound.outputMin) : "",
+          outputMax: bound?.outputMax !== undefined ? String(bound.outputMax) : "",
+          action: bound?.action === "exclude" ? "exclude" : "warn",
+        }
+      }
+      const setPriceField = (
+        currency: string,
+        field: keyof PriceLimitDraft,
+        value: string,
+      ) => {
+        setPriceDrafts({ ...priceDrafts(), [currency]: { ...priceDraft(currency), [field]: value } })
+      }
+      const savePriceLimits = async (currency: string) => {
+        const draft = priceDraft(currency)
+        const bound: PriceLimits = { action: draft.action }
+        let cleared = true
+        for (const key of ["inputMin", "inputMax", "outputMin", "outputMax"] as const) {
+          const text = draft[key].trim()
+          if (text === "") continue
+          const value = Number(text)
+          if (!Number.isFinite(value) || value < 0) {
+            setLocalError("Границы цены должны быть неотрицательными числами")
+            return
+          }
+          bound[key] = value
+          cleared = false
+        }
+        const limits: Record<string, PriceLimits> = { ...(status()?.priceLimits ?? {}) }
+        if (cleared) delete limits[currency]
+        else limits[currency] = bound
+        const saved = await configure(
+          { priceLimits: limits },
+          cleared
+            ? `Границы цены для ${currency} удалены`
+            : `Границы цены для ${currency} сохранены`,
+        )
+        if (saved) {
+          setPriceDrafts((previous) => {
+            const next = { ...previous }
+            delete next[currency]
+            return next
+          })
+        }
+      }
+
       const editGroup = (group?: ManualGroup) => {
         setEditorOriginal(group?.name ?? "")
         setEditorName(group?.name ?? `route-${(status()?.manualGroups.length ?? 0) + 1}`)
@@ -367,6 +508,12 @@ export default Plugin.define({
                   <Show when={model.cooldownMs > 0}>
                     <span class="mar-badge" data-tone="warning">cooldown {Math.ceil(model.cooldownMs / 1000)} с</span>
                   </Show>
+                  <Show when={model.priceLimitBreached}>
+                    <span class="mar-badge" data-tone="warning" title="Подтверждённый аккаунтный тариф вне заданных границ цены">вне границ цены</span>
+                  </Show>
+                  <Show when={model.thresholdExcluded}>
+                    <span class="mar-badge" data-tone="warning" title="Исключена из роутинга порогом; вернётся автоматически, когда значение вернётся в норму">исключена порогом</span>
+                  </Show>
                 </div>
                 <div class="mar-model-id">{model.model}</div>
                 <Show when={model.groups.length > 0}>
@@ -377,6 +524,11 @@ export default Plugin.define({
             <div class="mar-metric" title={priceTitle}>
               <span class="mar-metric-value">{formatPrice(tier?.input, model.costCurrency)} / {formatPrice(tier?.output, model.costCurrency)}</span>
               <span class="mar-metric-label">{model.costCurrency ?? "—"} / 1M input · output{model.priceState === "live" ? " · live" : model.priceState === "stale" ? " · stale" : ""}</span>
+              <Show when={priceOrientation(model).length > 0}>
+                <span class="mar-orientation" title={orientationTitle()}>
+                  ≈ {priceOrientation(model).map((item) => formatPrice(item.value, item.unit)).join(" · ")}
+                </span>
+              </Show>
               <div class="mar-meter" aria-hidden="true"><div class="mar-meter-fill" style={{ width: `${priceRatio}%` }} /></div>
             </div>
             <div class="mar-metric">
@@ -457,6 +609,9 @@ export default Plugin.define({
                       <span class="mar-badge" data-tone={account.state === "live" ? "free" : account.state === "stale" ? "warning" : undefined}>
                         {account.state === "live" ? "live" : account.state === "stale" ? "stale" : "unsupported"}
                       </span>
+                      <Show when={account.lowBalance}>
+                        <span class="mar-badge" data-tone="warning" title="Остаток средств ниже заданного минимума">ниже минимума</span>
+                      </Show>
                       <Show when={account.keySource === "plugin"}>
                         <span class="mar-badge" data-tone="free" title="Аккаунтный ключ сохранён в зашифрованном хранилище плагина">ключ плагина</span>
                       </Show>
@@ -472,18 +627,38 @@ export default Plugin.define({
                       <Show when={account.updatedAt}>
                         <span class="mar-muted">{new Date(account.updatedAt!).toLocaleTimeString("ru-RU")}</span>
                       </Show>
-                      <Show when={VAULT_PROVIDER_IDS.includes(account.providerID)}>
+                      <Show when={thresholdSummary(account)}>
+                        <span class="mar-account-note" title="Пороги мониторинга в валюте аккаунта">порог: {thresholdSummary(account)}</span>
+                      </Show>
+                      <Show when={orientation(account.balance, account.balanceCurrency).length > 0}>
+                        <span class="mar-account-note" title={orientationTitle()}>
+                          ≈ {orientation(account.balance, account.balanceCurrency).map((item) => formatBalance(item.value, item.unit)).join(" · ")}
+                        </span>
+                      </Show>
+                      <Show when={account.state !== "unsupported" || VAULT_PROVIDER_IDS.includes(account.providerID)}>
                         <div class="mar-account-actions">
-                          <ctx.ui.Button
-                            size="small"
-                            variant="ghost"
-                            disabled={saving()}
-                            onClick={() => { setKeyProvider(account.providerID); setKeyDraft("") }}
-                          >
-                            {account.pluginKey ? "Заменить ключ" : "Задать ключ"}
-                          </ctx.ui.Button>
-                          <Show when={account.pluginKey}>
-                            <ctx.ui.Button size="small" variant="danger" disabled={saving()} onClick={() => void clearAccountKey(account.providerID)}>Удалить ключ</ctx.ui.Button>
+                          <Show when={account.state !== "unsupported"}>
+                            <ctx.ui.Button
+                              size="small"
+                              variant="ghost"
+                              disabled={saving()}
+                              onClick={() => openThresholdForm(account)}
+                            >
+                              {status()?.accountThresholds?.[account.providerID] ? "Изменить пороги" : "Пороги"}
+                            </ctx.ui.Button>
+                          </Show>
+                          <Show when={VAULT_PROVIDER_IDS.includes(account.providerID)}>
+                            <ctx.ui.Button
+                              size="small"
+                              variant="ghost"
+                              disabled={saving()}
+                              onClick={() => { setKeyProvider(account.providerID); setKeyDraft("") }}
+                            >
+                              {account.pluginKey ? "Заменить ключ" : "Задать ключ"}
+                            </ctx.ui.Button>
+                            <Show when={account.pluginKey}>
+                              <ctx.ui.Button size="small" variant="danger" disabled={saving()} onClick={() => void clearAccountKey(account.providerID)}>Удалить ключ</ctx.ui.Button>
+                            </Show>
                           </Show>
                         </div>
                       </Show>
@@ -512,6 +687,72 @@ export default Plugin.define({
                     <p class="mar-help">Ключ шифруется AES-256-GCM в хранилище плагина и отправляется только в аккаунтный API {keyProvider()}. Он не передаётся OpenCode и не отображается обратно.</p>
                   </form>
                 </Show>
+                <Show when={thresholdProvider()}>
+                  <form class="mar-key-form mar-threshold-form" onSubmit={(event) => { event.preventDefault(); void saveThreshold() }}>
+                    <label class="mar-threshold-field">
+                      <span>Минимальный остаток ({thresholdCurrencyLabel()})</span>
+                      <input class="mar-number" type="number" min="0" step="any" placeholder="не задан" value={thresholdMin()} onInput={(event) => setThresholdMin(event.currentTarget.value)} />
+                    </label>
+                    <label class="mar-threshold-field">
+                      <span>Действие при выходе за порог</span>
+                      <select class="mar-select" value={thresholdAction()} onChange={(event) => setThresholdAction(event.currentTarget.value as "warn" | "exclude")}>
+                        <option value="warn">Только предупреждать</option>
+                        <option value="exclude">Предупреждать и исключать из роутинга</option>
+                      </select>
+                    </label>
+                    <div class="mar-actions">
+                      <ctx.ui.Button variant="contrast" size="small" busy={saving()} onClick={() => void saveThreshold()}>Сохранить пороги</ctx.ui.Button>
+                      <ctx.ui.Button variant="ghost" size="small" disabled={saving()} onClick={() => setThresholdProvider("")}>Отмена</ctx.ui.Button>
+                    </div>
+                    <p class="mar-help">Порог остатка задаётся в валюте аккаунта и проверяется при каждом обновлении. «Исключать» убирает модели провайдера из выбора роутера; исключение снимается автоматически, как только остаток вернётся в норму. Границы цены задаются отдельно — сразу для всех моделей в валюте цены.</p>
+                  </form>
+                </Show>
+                <Show when={status()!.cbrOrientation}>
+                  <p class="mar-help">
+                    {status()!.cbr
+                      ? `Ориентировка «≈» показана по курсу ЦБ РФ на ${status()!.cbr!.date}${status()!.cbr!.stale ? " (курсы устарели: обновить не удалось)" : ""}. Значения приблизительные и в маршрутизации не участвуют.`
+                      : "Курс ЦБ РФ ещё не загружен: ориентировка появится после первого успешного запроса к публичному API ЦБ РФ."}
+                  </p>
+                </Show>
+              </div>
+            </section>
+
+            <section class="mar-panel">
+              <div class="mar-panel-body">
+                <h3>Границы цены для всех моделей</h3>
+                <p class="mar-help">Границы задаются в валюте аккаунтной цены и применяются сразу ко всем моделям всех провайдеров с подтверждённым аккаунтным тарифом в этой валюте (цена за 1M токенов, input и output первого тарифа). Значения в разных валютах никогда не смешиваются. «Исключать из роутинга» убирает модели вне границ из выбора роутера — переключение на допустимые модели происходит автоматически при следующем выборе; исключение снимается само, когда цена вернётся в границы.</p>
+                <Show when={limitCurrencies().length === 0}>
+                  <div class="mar-empty">Аккаунтные валюты цен ещё не подтверждены: границы можно задать, когда провайдеры вернут тарифы.</div>
+                </Show>
+                <For each={limitCurrencies()}>{(currency) => (
+                  <div class="mar-price-limit-row">
+                    <span class="mar-price-limit-currency">{currency}</span>
+                    <label class="mar-threshold-field">
+                      <span>input ≤</span>
+                      <input class="mar-number" type="number" min="0" step="any" placeholder="нет" value={priceDraft(currency).inputMax} onInput={(event) => setPriceField(currency, "inputMax", event.currentTarget.value)} />
+                    </label>
+                    <label class="mar-threshold-field">
+                      <span>output ≤</span>
+                      <input class="mar-number" type="number" min="0" step="any" placeholder="нет" value={priceDraft(currency).outputMax} onInput={(event) => setPriceField(currency, "outputMax", event.currentTarget.value)} />
+                    </label>
+                    <label class="mar-threshold-field">
+                      <span>input ≥</span>
+                      <input class="mar-number" type="number" min="0" step="any" placeholder="нет" value={priceDraft(currency).inputMin} onInput={(event) => setPriceField(currency, "inputMin", event.currentTarget.value)} />
+                    </label>
+                    <label class="mar-threshold-field">
+                      <span>output ≥</span>
+                      <input class="mar-number" type="number" min="0" step="any" placeholder="нет" value={priceDraft(currency).outputMin} onInput={(event) => setPriceField(currency, "outputMin", event.currentTarget.value)} />
+                    </label>
+                    <label class="mar-threshold-field">
+                      <span>Действие</span>
+                      <select class="mar-select" value={priceDraft(currency).action} onChange={(event) => setPriceField(currency, "action", event.currentTarget.value)}>
+                        <option value="warn">Только предупреждать</option>
+                        <option value="exclude">Предупреждать и исключать из роутинга</option>
+                      </select>
+                    </label>
+                    <ctx.ui.Button variant="contrast" size="small" busy={saving()} onClick={() => void savePriceLimits(currency)}>Сохранить</ctx.ui.Button>
+                  </div>
+                )}</For>
               </div>
             </section>
 
@@ -529,6 +770,10 @@ export default Plugin.define({
                   <div class="mar-setting">
                     <div class="mar-setting-copy"><span class="mar-setting-title">Продолжение после лимита</span><span class="mar-setting-description">Synthetic-продолжение без повторной отправки prompt</span></div>
                     <ctx.ui.Switch checked={status()!.resumeAfterFailover} disabled={saving()} hideLabel label="Автоматически продолжать после failover" onChange={(resumeAfterFailover) => void configure({ resumeAfterFailover })} />
+                  </div>
+                  <div class="mar-setting">
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Ориентировка по курсу ЦБ РФ</span><span class="mar-setting-description">Приблизительные эквиваленты балансов и цен во всех валютах аккаунтов; на маршрутизацию не влияет</span></div>
+                    <ctx.ui.Switch checked={status()!.cbrOrientation} disabled={saving()} hideLabel label="Показывать приблизительные эквиваленты по курсу ЦБ РФ" onChange={(cbrOrientation) => void configure({ cbrOrientation })} />
                   </div>
                   <label class="mar-setting">
                     <div class="mar-setting-copy"><span class="mar-setting-title">Стратегия по умолчанию</span><span class="mar-setting-description">Используется группами без собственной стратегии</span></div>
@@ -609,7 +854,7 @@ export default Plugin.define({
                 )}</For>
                 <Show when={sections().length === 0}><div class="mar-empty">Модели не найдены. Измените поиск или фильтр.</div></Show>
               </section>
-              <p class="mar-footer-note">{accountsNote()} Цены — из аккаунтных API провайдеров в валюте аккаунта за миллион токенов, input / output первого тарифа; разные валюты не сравниваются между собой. Без подтверждения аккаунтным API цена не показывается. Скорость, TTFB и latency появляются после реальных шагов; это не заранее заданный бенчмарк. Переключатели каталога меняют только локальный роутинг и не изменяют credentials или глобальные настройки провайдера.</p>
+              <p class="mar-footer-note">{accountsNote()} Цены — из аккаунтных API провайдеров в валюте аккаунта за миллион токенов, input / output первого тарифа; разные валюты не сравниваются между собой. Без подтверждения аккаунтным API цена не показывается. Порог остатка задаётся для каждого провайдера в валюте его аккаунта; границы цены — сразу для всех моделей в валюте цены. Ориентировка «≈» — приблизительная, по курсу ЦБ РФ, и в маршрутизации не используется. Скорость, TTFB и latency появляются после реальных шагов; это не заранее заданный бенчмарк. Переключатели каталога меняют только локальный роутинг и не изменяют credentials или глобальные настройки провайдера.</p>
             </Show>
 
             <Show when={tab() === "groups"}>

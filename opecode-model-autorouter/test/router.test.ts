@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   buildRouteGroups,
+  evaluateGuardrails,
   isLimitError,
   modelKey,
   parseRetryAfter,
@@ -1025,4 +1026,203 @@ test("cleanup: registrations and event state are disposed, late continuation is 
   ctx.emit({ type: "session.execution.failed", data: { sessionID: "ses", error: { status: 429 } } })
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(ctx.synthetics.length, 0)
+})
+
+test("guardrails: balances use the account currency, price limits apply globally per price currency", () => {
+  const confirmed = model("usd", "same", 10)
+  confirmed.costCurrency = "USD"
+  confirmed.priceState = "live"
+  const unconfirmed = model("usd", "native", 99)
+  const foreign = model("usd", "foreign", 900)
+  foreign.costCurrency = "RUB"
+  foreign.priceState = "live"
+  const otherProvider = model("eur", "same", 20)
+  otherProvider.costCurrency = "USD"
+  otherProvider.priceState = "live"
+  const accounts = new Map<string, AccountSnapshot>([
+    ["usd", { ...accountSnapshot("usd", {}), balance: { amount: 3, currency: "USD" } }],
+  ])
+  const models = [confirmed, unconfirmed, foreign, otherProvider]
+
+  const warn = evaluateGuardrails(
+    models,
+    accounts,
+    { usd: { minBalance: 5, action: "warn" } },
+    { USD: { inputMax: 15, action: "warn" } },
+  )
+  assert.deepEqual([...warn.lowBalance], ["usd"])
+  // One USD limit covers every provider: 20 > 15 breaches, 10 stays inside.
+  assert.deepEqual([...warn.priceBreached], ["eur/same"])
+  assert.equal(warn.excluded.size, 0)
+  // Models without a confirmed account price are never flagged, even with a native cost.
+  assert.equal(warn.priceBreached.has("usd/native"), false)
+  // Ruble prices are never compared against the USD bound.
+  assert.equal(warn.priceBreached.has("usd/foreign"), false)
+
+  const exclude = evaluateGuardrails(
+    models,
+    accounts,
+    { usd: { minBalance: 5, action: "exclude" } },
+    {},
+  )
+  assert.deepEqual([...exclude.excluded].sort(), ["usd/foreign", "usd/native", "usd/same"])
+  assert.equal(exclude.priceBreached.size, 0)
+
+  const priceOnly = evaluateGuardrails(models, accounts, {}, {
+    USD: { inputMax: 15, action: "exclude" },
+  })
+  assert.deepEqual([...priceOnly.excluded], ["eur/same"])
+  assert.equal(priceOnly.lowBalance.size, 0)
+
+  // Lower bounds are checked in the price currency as well: output 900 < 1000.
+  const lower = evaluateGuardrails(models, accounts, {}, {
+    RUB: { outputMin: 1000, action: "exclude" },
+  })
+  assert.deepEqual([...lower.excluded], ["usd/foreign"])
+  assert.deepEqual([...lower.priceBreached], ["usd/foreign"])
+
+  // Providers without account data are never balance-flagged.
+  const none = evaluateGuardrails(
+    models,
+    new Map(),
+    { usd: { minBalance: 5, action: "exclude" } },
+    {},
+  )
+  assert.equal(none.lowBalance.size, 0)
+  assert.equal(none.excluded.size, 0)
+})
+
+test("routing: threshold exclusions disable candidates without touching user switches", () => {
+  const group = buildRouteGroups([model("a"), model("b")], {}, new Set(["a/same"])).get("auto:same")!
+  assert.equal(group.candidates.length, 2)
+  assert.equal(group.candidates[0].disabled, true)
+  assert.equal(group.candidates[1].disabled, false)
+  assert.equal(
+    selectCandidate(group, { providerID: "a", id: "same" }, new Map(), new Map(), 0)!.providerID,
+    "b",
+  )
+})
+
+test("guardrails: warn marks, exclude reroutes and blocks select, recovery is automatic", async () => {
+  const ctx = fakeContext([model("a", "same"), model("b", "same")])
+  const snapshots = [
+    { ...accountSnapshot("a", { same: { input: 1, output: 1 } }), balance: { amount: 3, currency: "USD" } },
+    accountSnapshot("b", { same: { input: 2, output: 2 } }),
+  ]
+  ctx.pricing = {
+    async load() {
+      return snapshots
+    },
+  }
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    const modelA = (value: any) => value.models.find((item: any) => item.model === "a/same")
+    const modelB = (value: any) => value.models.find((item: any) => item.model === "b/same")
+    const accountA = (value: any) => value.accounts.find((item: any) => item.providerID === "a")
+
+    let status = (await ctx.rpcHandlers.configure({
+      accountThresholds: { a: { minBalance: 5, action: "warn" } },
+    })) as any
+    assert.equal(accountA(status).lowBalance, true)
+    assert.deepEqual(status.accountThresholds, { a: { minBalance: 5, action: "warn" } })
+    assert.equal(modelA(status).thresholdExcluded, undefined)
+    // «Только предупреждать» does not change selection: the current model stays.
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.length, 0)
+
+    status = (await ctx.rpcHandlers.configure({
+      accountThresholds: { a: { minBalance: 5, action: "exclude" } },
+    })) as any
+    assert.equal(modelA(status).thresholdExcluded, true)
+    // The user-level switch is untouched by automatic exclusions.
+    assert.equal(modelA(status).routingEnabled, true)
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "b")
+    await assert.rejects(
+      ctx.rpcHandlers.select({ sessionID: "ses", model: "a/same" }),
+      /model is unavailable/u,
+    )
+
+    // Global price limits apply to every provider: b/same input 2 > 1.5 USD breaches.
+    status = (await ctx.rpcHandlers.configure({
+      accountThresholds: {},
+      priceLimits: { USD: { inputMax: 1.5, action: "exclude" } },
+    })) as any
+    assert.deepEqual(status.accountThresholds, {})
+    assert.deepEqual(status.priceLimits, { USD: { inputMax: 1.5, action: "exclude" } })
+    assert.equal(accountA(status).lowBalance, undefined)
+    assert.equal(modelB(status).priceLimitBreached, true)
+    assert.equal(modelB(status).thresholdExcluded, true)
+    assert.equal(modelA(status).priceLimitBreached, undefined)
+    assert.equal(modelA(status).thresholdExcluded, undefined)
+    // The next prompt auto-switches away from the breached model.
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "a")
+    await assert.rejects(
+      ctx.rpcHandlers.select({ sessionID: "ses", model: "b/same" }),
+      /model is unavailable/u,
+    )
+
+    // Cleared limits roll exclusions back automatically.
+    status = (await ctx.rpcHandlers.configure({ priceLimits: {} })) as any
+    assert.deepEqual(status.priceLimits, {})
+    assert.equal(modelB(status).priceLimitBreached, undefined)
+    assert.equal(modelB(status).thresholdExcluded, undefined)
+    await ctx.hooks.get("prompt")!({ sessionID: "ses" })
+    assert.equal(ctx.switches.at(-1)?.model.providerID, "a")
+  } finally {
+    cleanup()
+  }
+})
+
+const cbrXmlFixture = `<?xml version="1.0" encoding="windows-1251"?>
+<ValCurs Date="31.10.2026"><Valute><CharCode>USD</CharCode><Nominal>1</Nominal><Value>92,5123</Value><VunitRate>92,5123</VunitRate></Valute></ValCurs>`
+
+test("cbr: orientation is opt-in, cached, display-only and cleared when switched off", async () => {
+  const ctx = fakeContext([model("a", "same"), model("b", "same")])
+  ctx.pricing = {
+    async load() {
+      return []
+    },
+  }
+  const requests: string[] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (url: unknown) => {
+    requests.push(String(url))
+    return new Response(cbrXmlFixture, {
+      status: 200,
+      headers: { "content-type": "text/xml" },
+    })
+  }) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.configure !== undefined)
+    let status = (await ctx.rpcHandlers.rescan({})) as any
+    assert.equal(status.cbrOrientation, false)
+    assert.equal(status.cbr, undefined)
+    // Disabled orientation means zero extra network requests.
+    assert.equal(requests.length, 0)
+
+    status = (await ctx.rpcHandlers.configure({ cbrOrientation: true })) as any
+    assert.deepEqual(requests, ["https://www.cbr.ru/scripts/XML_daily.asp"])
+    assert.equal(status.cbrOrientation, true)
+    assert.equal(status.cbr.date, "31.10.2026")
+    assert.equal(status.cbr.rates.USD, 92.5123)
+    assert.equal(status.cbr.rates.RUB, 1)
+    assert.equal(status.cbr.stale, false)
+    assert.ok(status.cbr.fetchedAt)
+
+    await ctx.rpcHandlers.rescan({})
+    // Cached rates are reused within the TTL.
+    assert.equal(requests.length, 1)
+
+    status = (await ctx.rpcHandlers.configure({ cbrOrientation: false })) as any
+    assert.equal(status.cbr, undefined)
+    assert.equal(status.cbrOrientation, false)
+    assert.equal(requests.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
 })

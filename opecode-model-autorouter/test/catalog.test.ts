@@ -1,7 +1,10 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
+  accountCurrencies,
   catalogPrice,
+  cbrConvert,
+  cbrCross,
   formatBalance,
   formatLatency,
   formatPrice,
@@ -111,4 +114,35 @@ test("GUI catalog: formatting keeps price, balance, generation speed and latency
   assert.equal(formatSpeed(125.25), "125,3 ток/с")
   assert.equal(formatLatency(80), "80 мс")
   assert.equal(formatLatency(1500), "1,5 с")
+})
+
+test("GUI catalog: ЦБ orientation converts via the RUB base and refuses unknown rates", () => {
+  const rates = { RUB: 1, USD: 92.5, EUR: 107.5 }
+  assert.equal(cbrCross(rates, "USD", "RUB"), 92.5)
+  assert.equal(cbrCross(rates, "RUB", "USD"), 1 / 92.5)
+  assert.ok(Math.abs(cbrCross(rates, "USD", "EUR")! - 92.5 / 107.5) < 1e-12)
+  assert.equal(cbrCross(rates, "USD", "USD"), 1)
+  // A missing rate is never invented or approximated.
+  assert.equal(cbrCross(rates, "USD", "KZT"), undefined)
+  assert.equal(cbrCross(undefined, "USD", "RUB"), undefined)
+  assert.equal(cbrCross(rates, undefined, "RUB"), undefined)
+  assert.equal(cbrConvert(rates, 10, "USD", "RUB"), 925)
+  assert.equal(cbrConvert(rates, undefined, "USD", "RUB"), undefined)
+  assert.equal(cbrConvert(rates, 10, "USD", "KZT"), undefined)
+})
+
+test("GUI catalog: orientation currencies come only from balances and confirmed prices", () => {
+  const status = {
+    accounts: [
+      { providerID: "a", balance: 5, balanceCurrency: "USD" },
+      // Without a confirmed balance amount the currency stays unknown.
+      { providerID: "b", balanceCurrency: "EUR" },
+      { providerID: "c", balance: 100, balanceCurrency: "RUB" },
+    ],
+    models: [
+      model("a", "one", { costCurrency: "USD" }),
+      model("d", "two", { cost: undefined }),
+    ],
+  }
+  assert.deepEqual(accountCurrencies(status as never), ["RUB", "USD"])
 })

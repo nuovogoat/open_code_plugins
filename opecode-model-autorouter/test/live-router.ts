@@ -245,6 +245,81 @@ try {
   )
   assert.deepEqual(await call("clearAccountKey", { providerID: "openrouter" }), { cleared: false })
 
+  // Threshold monitoring accepts real configuration and clears cleanly; the huge
+  // minimum can only produce a «warn» mark because the action stays non-excluding.
+  const withThresholds = await call("configure", {
+    accountThresholds: { plusvibe: { minBalance: 1_000_000, action: "warn" } },
+  })
+  assert.deepEqual(withThresholds.accountThresholds.plusvibe, {
+    minBalance: 1_000_000,
+    action: "warn",
+  })
+  const thresholdAccount = withThresholds.accounts.find(
+    (item: any) => item.providerID === "plusvibe",
+  )
+  if (thresholdAccount?.balance !== undefined) {
+    assert.equal(thresholdAccount.lowBalance, true)
+  }
+  assert.ok(
+    withThresholds.models.every((item: any) => item.thresholdExcluded === undefined),
+    "warn action must never exclude models",
+  )
+  const withoutThresholds = await call("configure", { accountThresholds: {} })
+  assert.deepEqual(withoutThresholds.accountThresholds, {})
+  assert.ok(withoutThresholds.accounts.every((item: any) => item.lowBalance === undefined))
+
+  // Global price limits: an impossibly low RUB maximum can only «warn» because
+  // the action stays non-excluding; every RUB-priced model with a confirmed
+  // account tariff must be flagged, and no other currency may be affected.
+  const withLimits = await call("configure", {
+    priceLimits: { RUB: { inputMax: 0.000001, action: "warn" } },
+  })
+  assert.deepEqual(withLimits.priceLimits.RUB, { inputMax: 0.000001, action: "warn" })
+  const rubModels = withLimits.models.filter(
+    (item: any) => item.costCurrency === "RUB" && item.priceState !== undefined,
+  )
+  if (rubModels.length > 0) {
+    assert.ok(
+      rubModels.every((item: any) => item.priceLimitBreached === true),
+      "every confirmed RUB price exceeds the 0.000001 bound",
+    )
+  }
+  assert.ok(
+    withLimits.models.every(
+      (item: any) => item.costCurrency === "RUB" || item.priceLimitBreached === undefined,
+    ),
+    "RUB limits must never flag other currencies",
+  )
+  assert.ok(
+    withLimits.models.every((item: any) => item.thresholdExcluded === undefined),
+    "warn action must never exclude models",
+  )
+  const withoutLimits = await call("configure", { priceLimits: {} })
+  assert.deepEqual(withoutLimits.priceLimits, {})
+  assert.ok(
+    withoutLimits.models.every((item: any) => item.priceLimitBreached === undefined),
+    "cleared limits remove all price marks",
+  )
+
+  // ЦБ РФ orientation is opt-in; the public feed may be unreachable from this
+  // network, so either absence or a fully valid rate set is accepted.
+  const oriented = await call("configure", { cbrOrientation: true })
+  assert.equal(oriented.cbrOrientation, true)
+  if (oriented.cbr) {
+    assert.match(oriented.cbr.date, /^\d{2}\.\d{2}\.\d{4}$/u)
+    assert.equal(oriented.cbr.rates.RUB, 1)
+    assert.equal(typeof oriented.cbr.rates.USD, "number")
+    assert.ok(oriented.cbr.rates.USD > 0)
+    assert.equal(typeof oriented.cbr.stale, "boolean")
+  }
+  const unoriented = await call("configure", { cbrOrientation: false })
+  assert.equal(unoriented.cbr, undefined)
+  assert.equal(unoriented.cbrOrientation, false)
+  const resetStatus = await call("configure", { reset: true })
+  assert.equal(resetStatus.cbr, undefined)
+  assert.deepEqual(resetStatus.accountThresholds, {})
+  assert.deepEqual(resetStatus.priceLimits, {})
+
   const candidate = status.groups[0].candidates[0].model
   const selected = await call("select", { sessionID, model: candidate })
   assert.equal(selected.selected, candidate)
@@ -275,6 +350,10 @@ try {
       manualGroups: status.groups.filter((group: any) => !group.automatic).length,
       singletonSelected: singleton?.model,
       selected,
+      thresholdsChecked: true,
+      cbrOrientation: oriented.cbr
+        ? { date: oriented.cbr.date, usd: oriented.cbr.rates.USD, stale: oriented.cbr.stale }
+        : "feed unreachable from this network",
       promptsSent: 0,
     }),
   )

@@ -2,6 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   loadAccountSnapshots,
+  loadCbrRates,
+  parseCbrDaily,
   parseOpenRouterCreditsBalance,
   parseOpenRouterKeyBalance,
   parseOpenRouterModels,
@@ -302,4 +304,79 @@ test("accounts: aborting the refresh rejects instead of caching partial data", a
       async () => ({ value: "key", source: "opencode" }),
     ),
   )
+})
+
+const cbrXml = `<?xml version="1.0" encoding="windows-1251"?>
+<ValCurs Date="31.10.2026" name="Ежедневные курсы валют">
+  <Valute ID="R01235">
+    <NumCode>840</NumCode>
+    <CharCode>USD</CharCode>
+    <Nominal>1</Nominal>
+    <Name>Доллар США</Name>
+    <Value>92,5123</Value>
+    <VunitRate>92,5123</VunitRate>
+  </Valute>
+  <Valute ID="R01398">
+    <NumCode>398</NumCode>
+    <CharCode>KZT</CharCode>
+    <Nominal>100</Nominal>
+    <Name>Казахстанских тенге</Name>
+    <Value>17,3456</Value>
+    <VunitRate>0,1735</VunitRate>
+  </Valute>
+  <Valute ID="R01239">
+    <CharCode>EUR</CharCode>
+    <Nominal>1</Nominal>
+    <Name>Евро</Name>
+    <Value>107,1234</Value>
+  </Valute>
+  <Valute ID="R00000">
+    <CharCode>XXX</CharCode>
+    <Nominal>1</Nominal>
+    <Name>Битая запись</Name>
+    <Value>не число</Value>
+  </Valute>
+</ValCurs>`
+
+test("cbr: daily XML becomes RUB-based rates with the published date", () => {
+  const parsed = parseCbrDaily(cbrXml)
+  assert.equal(parsed?.date, "31.10.2026")
+  assert.equal(parsed?.rates.USD, 92.5123)
+  // VunitRate is already per one unit and wins over Value/Nominal.
+  assert.equal(parsed?.rates.KZT, 0.1735)
+  assert.equal(parsed?.rates.EUR, 107.1234)
+  // The base is defined by the parser, never fetched or invented.
+  assert.equal(parsed?.rates.RUB, 1)
+  assert.equal(parsed && "XXX" in parsed.rates, false)
+  assert.equal(parseCbrDaily("<html>not a feed</html>"), undefined)
+  assert.equal(parseCbrDaily('<ValCurs Date="31.10.2026"></ValCurs>'), undefined)
+})
+
+function xmlFetcher(body: string, requests: Array<{ url: string; init?: RequestInit }>, status = 200) {
+  return (async (url: unknown, init?: RequestInit) => {
+    requests.push({ url: String(url), init })
+    // The real fetch rejects on an aborted signal; mirror that boundary here.
+    if (init?.signal?.aborted) throw new DOMException("This operation was aborted", "AbortError")
+    return new Response(body, {
+      status,
+      headers: { "content-type": "text/xml; charset=windows-1251" },
+    })
+  }) as typeof fetch
+}
+
+test("cbr: the loader uses only the hardcoded origin without credentials and rejects bad feeds", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = []
+  const rates = await loadCbrRates(xmlFetcher(cbrXml, requests), new AbortController().signal)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].url, "https://www.cbr.ru/scripts/XML_daily.asp")
+  // The public feed is anonymous: no credential headers are attached.
+  assert.equal(new Headers(requests[0].init?.headers).get("authorization"), null)
+  assert.equal(rates.date, "31.10.2026")
+  assert.equal(rates.rates.USD, 92.5123)
+  assert.ok(rates.fetchedAt > 0)
+  await assert.rejects(loadCbrRates(xmlFetcher(cbrXml, [], 500), new AbortController().signal))
+  await assert.rejects(loadCbrRates(xmlFetcher("not a feed", []), new AbortController().signal))
+  const aborted = new AbortController()
+  aborted.abort()
+  await assert.rejects(loadCbrRates(xmlFetcher(cbrXml, []), aborted.signal))
 })

@@ -7,7 +7,7 @@
 | Плагин | Версия | Назначение |
 | --- | --- | --- |
 | [project-folder-tabs](project-folder-tabs/) | 1.4.1 | Показывает имена папок проектов на вкладках сессий |
-| [opecode-model-autorouter](opecode-model-autorouter/) | 0.4.0 | Выбирает модели по скорости, стоимости и доступности; аккаунтные тарифы и баланс из API провайдеров; необязательный зашифрованный сейф аккаунтных ключей; GUI каталога и route-групп |
+| [opecode-model-autorouter](opecode-model-autorouter/) | 0.5.0 | Выбирает модели по скорости, стоимости и доступности; аккаунтные тарифы и баланс из API провайдеров; мониторинг минимального остатка и глобальных границ цены с автопереключением; необязательная ориентировка по курсу ЦБ РФ; необязательный зашифрованный сейф аккаунтных ключей; GUI каталога и route-групп |
 
 ## Установка и обновление
 
@@ -22,7 +22,7 @@ opencode plugin add 'github:nuovogoat/open_code_plugins#main::path:opecode-model
 
 ```sh
 opencode plugin add 'github:nuovogoat/open_code_plugins#project-folder-tabs/v1.4.1::path:project-folder-tabs'
-opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter/v0.4.0::path:opecode-model-autorouter'
+opencode plugin add 'github:nuovogoat/open_code_plugins#opecode-model-autorouter/v0.5.0::path:opecode-model-autorouter'
 ```
 
 Проверка и установка обновлений всех настроенных пакетных плагинов:
