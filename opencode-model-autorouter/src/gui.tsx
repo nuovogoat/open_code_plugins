@@ -25,6 +25,9 @@ import {
 import { manualGroupConfiguration, routerScope } from "./gui-state.ts"
 import css from "./gui.css?inline"
 
+/** Injected at build time from package.json — the single source of the product version (§10). */
+declare const __PLUGIN_VERSION__: string
+
 interface ConfigurePatch {
   enabled?: boolean
   autoDiscover?: boolean
@@ -682,6 +685,25 @@ export default Plugin.define({
 
             <section class="mar-panel">
               <div class="mar-panel-body">
+                <h3>Справка</h3>
+                <p class="mar-help">
+                  Панель встроена в настройки OpenCode Desktop: окна и строка меню принадлежат хосту, поэтому справка и сведения о плагине живут прямо в панели (отклонение зафиксировано в DECISIONS.md плагина). Маршрутизатор выбирает chat-модель для каждого prompt из каталога провайдеров OpenCode: объединяет одинаковые model ID разных провайдеров в route-группы, применяет стратегию, переключается при лимитах и отказах и считает затраты.
+                </p>
+                <ul class="mar-help-list">
+                  <li><b>Подключить аккаунт провайдера:</b> в «Аккаунты провайдеров» нажмите «Аккаунтные цены и баланс» (кнопка есть только у провайдеров с подтверждённым аккаунтным API), введите ключ и сохраните. Ключ шифруется AES-256-GCM в хранилище плагина и отправляется только в аккаунтный API этого провайдера — не OpenCode и не другим адресам. Результат: подтверждённые тарифы и баланс; аккаунтные цены приоритетнее публичных, статистика затрат считается по тарифу аккаунта. «Удалить ключ» возвращает расчёт к данным OpenCode и публичным ценам. Провайдеру без аккаунтного API ключ ввести нельзя: отправлять его некуда, настройка была бы мёртвой.</li>
+                  <li><b>Выбрать модель вручную:</b> на вкладке «Каталог и сравнение» нажмите «Выбрать» у нужной модели; целевая сессия задаётся в поле «Сессия для ручного выбора» (кнопка prompt не отправляет). Если маршрутизатор позже решит заменить ручную модель, он не сделает это молча: вопрос появится в панели «Защита ручного выбора». «Оставить» закрепляет ваш выбор за сессией, «Переключить» передаёт сессию роутеру (далее переключает молча), «Снять закрепление» возвращает автоматическую маршрутизацию. Аварийный failover при отказе или лимите выполняется без вопроса, но с уведомлением.</li>
+                  <li><b>Посчитать затраты:</b> «Статистика использования» показывает токены и стоимость завершённых шагов по сессиям и итого. Стоимость — по подтверждённому тарифу аккаунта в валюте аккаунта (токены рассуждения тарифицируются как output; кэш — только если тариф объявляет цены кэша), без тарифа — по измерению самого OpenCode в USD. Прочерк означает, что подтверждённого основания нет: цифры не выдумываются. Разные валюты не суммируются — «Итого» даёт разрез по валютам. Обновление вместе со статусом (порядка 30 секунд); при удалении сессии её строка исчезает.</li>
+                  <li><b>Ограничить дорогие модели и бедные аккаунты:</b> «Границы цены для всех моделей» задают вилку цены за 1M токенов в валюте аккаунтной цены; пороги остатка — у каждого аккаунта в его валюте. Действие «Предупреждать и исключать из роутинга» убирает модели вне границ (или аккаунты ниже порога) из выбора роутера; исключение снимается автоматически, когда цена или остаток вернутся в норму. Границы и пороги никогда не пересчитываются по курсу ЦБ и проверяются строго в своей валюте.</li>
+                  <li><b>Сменить стратегию:</b> «Стратегия по умолчанию» применяется к группам без собственной стратегии: «Сначала бесплатные, затем быстрые» (free-fastest), «Самая быстрая», «Самая дешёвая» (cheapest), «Ручной приоритет» (порядок моделей в группе). Стратегия ручной группы задаётся в её редакторе и перекрывает глобальную. В «cheapest» разные валюты сравниваются численно только при включённой ориентировке по курсу ЦБ РФ и только приблизительно.</li>
+                  <li><b>Граничные случаи:</b> при сбое сети значения не выдумываются — снапшот аккаунта помечается устаревшим (stale), публичный прайс-лист показывает ошибку загрузки; нераспознанный формат прайса игнорируется целиком; устаревшие курсы ЦБ РФ помечаются датой последней успешной загрузки. Статистика ограничена 500 последними сессиями (старейшие выбывают).</li>
+                  <li><b>Сброс:</b> «Сбросить настройки» восстанавливает значения из opencode.json; метрики моделей, ключи и закреплённые модели не затрагиваются.</li>
+                </ul>
+                <p class="mar-about">opencode-model-autorouter · версия {__PLUGIN_VERSION__} · by nuovogoat · плагин платформы OpenCode (атрибуция и версия хоста — в «О программе» самого OpenCode Desktop)</p>
+              </div>
+            </section>
+
+            <section class="mar-panel">
+              <div class="mar-panel-body">
                 <h3>Аккаунты провайдеров</h3>
                 <p class="mar-help">Баланс и тарифы запрашиваются серверной частью из аккаунтных API провайдеров. По умолчанию используется ключ из connections OpenCode; дополнительно можно сохранить аккаунтный ключ в зашифрованном хранилище плагина — он не передаётся OpenCode, не отображается в GUI и не попадает в статус.</p>
                 <div class="mar-account-list">
@@ -973,51 +995,51 @@ export default Plugin.define({
               <div class="mar-panel-body">
                 <div class="mar-settings-grid">
                   <div class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Автоматическая маршрутизация</span><span class="mar-setting-description">Выбор модели и failover; RPC настроек остаётся доступным</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Автоматическая маршрутизация</span><span class="mar-setting-description">Роутер выбирает модель и выполняет failover. Выключение: сессии остаются на выбранных моделях, автопереключения и вопросы защиты прекращаются; каталог, статистика и настройки продолжают работать</span></div>
                     <ctx.ui.Switch checked={status()!.enabled} disabled={saving()} hideLabel label="Включить автоматическую маршрутизацию" onChange={(enabled) => void configure({ enabled })} />
                   </div>
                   <div class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Автоматические группы</span><span class="mar-setting-description">Одинаковые model ID у разных провайдеров</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Автоматические группы</span><span class="mar-setting-description">Группы из одинаковых model ID у разных провайдеров. Выключение: автоматические группы перестают строиться, маршрутизация идёт только по ручным группам и одиночным моделям</span></div>
                     <ctx.ui.Switch checked={status()!.autoDiscover} disabled={saving()} hideLabel label="Создавать автоматические группы" onChange={(autoDiscover) => void configure({ autoDiscover })} />
                   </div>
                   <div class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Продолжение после лимита</span><span class="mar-setting-description">Synthetic-продолжение без повторной отправки prompt</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Продолжение после лимита</span><span class="mar-setting-description">Synthetic-продолжение ответа без повторной отправки prompt. Выключение: после failover продолжение придётся запрашивать заново</span></div>
                     <ctx.ui.Switch checked={status()!.resumeAfterFailover} disabled={saving()} hideLabel label="Автоматически продолжать после failover" onChange={(resumeAfterFailover) => void configure({ resumeAfterFailover })} />
                   </div>
                   <div class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Защита ручного выбора модели</span><span class="mar-setting-description">Если модель выставлена не роутером, он спросит перед переключением и не перехватит молча</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Защита ручного выбора модели</span><span class="mar-setting-description">Замена выставленной вручную модели — только через вопрос в «Защите ручного выбора». Выключение: роутер переключает модели молча, закрепления не создаются (аварийный failover остаётся видимым)</span></div>
                     <ctx.ui.Switch checked={status()!.askBeforeOverride} disabled={saving()} hideLabel label="Спрашивать перед перехватом ручного выбора" onChange={(askBeforeOverride) => void configure({ askBeforeOverride })} />
                   </div>
                   <div class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Ориентировка по курсу ЦБ РФ</span><span class="mar-setting-description">Приблизительные эквиваленты «≈» балансов и цен; дополнительно включает приблизительное сравнение разных валют в ранжировании «cheapest» (провайдеры конвертируют по своим курсам — оценка неточна)</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Ориентировка по курсу ЦБ РФ</span><span class="mar-setting-description">Приблизительные эквиваленты «≈» балансов и цен; дополнительно включает приблизительное сравнение разных валют в ранжировании «cheapest» (провайдеры конвертируют по своим курсам — оценка неточна). Выключение: «≈»-эквиваленты исчезают, разные валюты в «cheapest» снова численно не сравниваются</span></div>
                     <ctx.ui.Switch checked={status()!.cbrOrientation} disabled={saving()} hideLabel label="Показывать приблизительные эквиваленты по курсу ЦБ РФ" onChange={(cbrOrientation) => void configure({ cbrOrientation })} />
                   </div>
                   <label class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Стратегия по умолчанию</span><span class="mar-setting-description">Используется группами без собственной стратегии</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Стратегия по умолчанию</span><span class="mar-setting-description">Применяется группами без собственной стратегии; изменение сразу влияет на выбор кандидата во всех таких группах. Стратегия ручной группы перекрывает глобальную</span></div>
                     <select class="mar-select" value={status()!.strategy} disabled={saving()} onChange={(event) => void configure({ strategy: event.currentTarget.value as Strategy })}>
                       <For each={strategies}>{(item) => <option value={item.value}>{item.label}</option>}</For>
                     </select>
                   </label>
                   <label class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Группа для каждого prompt</span><span class="mar-setting-description">По умолчанию группа определяется текущей моделью</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Группа для каждого prompt</span><span class="mar-setting-description">«Автоматически» — группа выводится из текущей модели. Фиксация группы: роутер предлагает модели только из неё независимо от текущей модели</span></div>
                     <select class="mar-select" value={status()!.defaultGroup ?? ""} disabled={saving()} onChange={(event) => void configure({ defaultGroup: event.currentTarget.value })}>
                       <option value="">Автоматически</option>
                       <For each={defaultGroups()}>{(name) => <option value={name}>{name}</option>}</For>
                     </select>
                   </label>
                   <label class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Сессия для ручного выбора</span><span class="mar-setting-description">Кнопка «Выбрать» не отправляет prompt</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Сессия для ручного выбора</span><span class="mar-setting-description">Цель кнопки «Выбрать» в каталоге (prompt не отправляется); смена влияет только на то, какая сессия получит ручную модель</span></div>
                     <select class="mar-select" value={selectedSession()?.key ?? ""} disabled={saving() || ctx.sessions.list().length === 0} onChange={(event) => setSessionKey(event.currentTarget.value)}>
                       <Show when={ctx.sessions.list().length === 0}><option value="">Нет открытых сессий</option></Show>
                       <For each={ctx.sessions.list()}>{(session) => <option value={session.key}>{session.id.slice(0, 20)} · {session.server.name}</option>}</For>
                     </select>
                   </label>
                   <label class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Cooldown, секунды</span><span class="mar-setting-description">Используется, если провайдер не вернул Retry-After</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Cooldown, секунды</span><span class="mar-setting-description">Пауза модели после лимита/отказа, если провайдер не вернул Retry-After. Уменьшение раньше возвращает модель в роутинг (риск повторных 429), увеличение снижает давление на провайдера</span></div>
                     <input class="mar-number" type="number" min="1" max="86400" step="1" value={status()!.cooldownMs / 1000} disabled={saving()} onChange={(event) => { const value = Number(event.currentTarget.value); if (value >= 1) void configure({ cooldownMs: value * 1000 }) }} />
                   </label>
                   <label class="mar-setting">
-                    <div class="mar-setting-copy"><span class="mar-setting-title">Сканирование, секунды</span><span class="mar-setting-description">Периодическое обновление каталога моделей</span></div>
+                    <div class="mar-setting-copy"><span class="mar-setting-title">Сканирование, секунды</span><span class="mar-setting-description">Период обновления каталога моделей. Уменьшение чаще опрашивает API провайдеров (нагрузка и лимиты запросов), минимум 5 с; увеличение делает каталог менее свежим</span></div>
                     <input class="mar-number" type="number" min="5" max="3600" step="5" value={status()!.rescanIntervalMs / 1000} disabled={saving()} onChange={(event) => { const value = Number(event.currentTarget.value); if (value >= 5) void configure({ rescanIntervalMs: value * 1000 }) }} />
                   </label>
                 </div>
@@ -1032,21 +1054,21 @@ export default Plugin.define({
             <Show when={tab() === "catalog"}>
               <div class="mar-toolbar">
                 <ctx.ui.TextInput type="search" label="Поиск моделей" placeholder="Модель, провайдер или route-группа…" value={search()} onInput={setSearch} />
-                <select class="mar-select" aria-label="Группировка каталога" value={grouping()} onChange={(event) => setGrouping(event.currentTarget.value as Grouping)}>
+                <select class="mar-select" aria-label="Группировка каталога" title="Как разложить модели в списке: по провайдерам, route-группам или без группировки. Влияет только на вид каталога, маршрутизация не меняется" value={grouping()} onChange={(event) => setGrouping(event.currentTarget.value as Grouping)}>
                   <option value="provider">Группировать: провайдер</option>
                   <option value="model">Группировать: model ID</option>
                   <option value="route">Группировать: route-группа</option>
                   <option value="price">Группировать: цена</option>
                   <option value="speed">Группировать: скорость</option>
                 </select>
-                <select class="mar-select" aria-label="Сортировка каталога" value={sorting()} onChange={(event) => setSorting(event.currentTarget.value as Sorting)}>
+                <select class="mar-select" aria-label="Сортировка каталога" title="Порядок строк каталога (имя, цена, скорость). Влияет только на вид списка, выбор роутера не меняется" value={sorting()} onChange={(event) => setSorting(event.currentTarget.value as Sorting)}>
                   <option value="name">Сортировать: имя</option>
                   <option value="provider">Сортировать: провайдер</option>
                   <option value="price">Сортировать: цена ↑</option>
                   <option value="speed">Сортировать: скорость ↓</option>
                   <option value="ttfb">Сортировать: TTFB ↑</option>
                 </select>
-                <label class="mar-check-label"><input type="checkbox" checked={enabledOnly()} onChange={(event) => setEnabledOnly(event.currentTarget.checked)} /> Только разрешённые</label>
+                <label class="mar-check-label" title="Показывать только модели, разрешённые в роутинге; запрещённые скрыть из вида. На сами настройки не влияет"><input type="checkbox" checked={enabledOnly()} onChange={(event) => setEnabledOnly(event.currentTarget.checked)} /> Только разрешённые</label>
               </div>
 
               <section class="mar-panel">

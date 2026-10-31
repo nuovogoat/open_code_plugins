@@ -19,6 +19,9 @@
 .mar-subtitle, .mar-help, .mar-muted { color: var(--mar-muted); }
 .mar-subtitle { margin: 5px 0 0; max-width: 780px; font-size: 13px; line-height: 1.5; }
 .mar-help { margin: 0; font-size: 12px; line-height: 1.5; }
+.mar-help-list { margin: 0; padding-left: 18px; color: var(--mar-muted); font-size: 12px; line-height: 1.55; display: flex; flex-direction: column; gap: 6px; }
+.mar-help-list b { color: var(--text-base, inherit); font-weight: 550; }
+.mar-about { margin: 0; padding-top: 10px; border-top: 1px solid var(--mar-border); color: var(--mar-muted); font-size: 12px; }
 .mar-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .mar-panel { border: 1px solid var(--mar-border); border-radius: 10px; background: var(--mar-surface); overflow: hidden; }
 .mar-panel-body { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
