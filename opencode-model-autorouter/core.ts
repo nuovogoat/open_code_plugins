@@ -1481,11 +1481,9 @@ export class ModelAutoRouter {
             const roster = [...new Set([...listed.data.map((p) => p.id), ...vaultIDs])]
             await this.vault.set(input.providerID, input.key, roster)
             this.vaultProviders.add(input.providerID)
-            // Force a fresh account update so the new key is picked up immediately,
-            // bypassing the refresh() debounce which may still be running from init().
-            await this.updateAccounts()
-            // Also trigger a full refresh for models/pricing, but don't block on it.
-            void this.refresh()
+            // Reset the debounce guard so refresh() runs a full cycle with the new key.
+            this.refreshing = undefined
+            await this.refresh()
             return { stored: true, providerID: input.providerID }
           },
           clearAccountKey: async (input: { providerID: string }) => {
