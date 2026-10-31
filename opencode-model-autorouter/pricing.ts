@@ -633,6 +633,17 @@ function capabilities(providerID: string): { pricing: boolean; balance: boolean;
   }
 }
 
+/**
+ * Whether a confirmed account API exists for this provider. A stored key for a
+ * provider without one would have no consumer — it could never be sent anywhere
+ * (keys go only to the fixed account-API origins in `capabilities`), so both the
+ * GUI and the `setAccountKey` RPC refuse it. Single source of truth for the
+ * `pricingSupported`/`balanceSupported` flags the account snapshots expose.
+ */
+export function accountCapable(providerID: string): boolean {
+  return capabilities(providerID).supported
+}
+
 export async function loadAccountSnapshots(
   fetcher: typeof fetch,
   signal: AbortSignal,

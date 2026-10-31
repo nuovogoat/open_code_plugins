@@ -1,4 +1,5 @@
 import {
+  accountCapable,
   extractProviderSite,
   loadAccountSnapshots,
   loadCbrRates,
@@ -1637,6 +1638,15 @@ export class ModelAutoRouter {
             const listed = this.ctx.provider ? await this.ctx.provider.list() : { data: [] as Array<{ id: string }> }
             const vaultIDs = (await this.vault.providers()) ?? []
             const roster = [...new Set([...listed.data.map((p) => p.id), ...vaultIDs])]
+            // A key for a provider without a confirmed account API has no
+            // consumer: it could never be sent anywhere (keys go only to the
+            // fixed account-API origins), so refuse it instead of storing dead
+            // config. Same rule the GUI uses to hide the button.
+            if (!accountCapable(input.providerID)) {
+              throw new Error(
+                `setAccountKey rejected: provider "${input.providerID}" has no confirmed account API, so a stored key would have no consumer`,
+              )
+            }
             await this.vault.set(input.providerID, input.key, roster)
             this.vaultProviders.add(input.providerID)
             // Directly update accounts so the new key is visible immediately,

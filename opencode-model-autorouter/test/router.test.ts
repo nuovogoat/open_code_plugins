@@ -523,6 +523,34 @@ test("vault: a plugin-stored key feeds the account API without ever being expose
   }
 })
 
+test("vault: setAccountKey rejects providers without a confirmed account API even when rostered", async () => {
+  // "apimaster" is visible to the router (it has models and appears in
+  // provider.list), but it has no confirmed account API: a stored key would
+  // have no consumer, so the RPC must refuse it before anything is persisted.
+  const ctx = fakeContext([model("apimaster", "same"), model("openrouter", "same")])
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response("{}", { status: 404 })) as typeof fetch
+  const cleanup = setupModelAutoRouter(ctx, {})
+  try {
+    await eventually(() => ctx.rpcHandlers.setAccountKey !== undefined)
+    await assert.rejects(
+      ctx.rpcHandlers.setAccountKey({ providerID: "apimaster", key: "secret" }),
+      /no confirmed account API/u,
+    )
+    for (const value of ctx.storageValues.values()) {
+      assert.equal(JSON.stringify(value).includes("secret"), false, "rejected key was persisted")
+    }
+    // A provider with a confirmed account API is still accepted.
+    assert.deepEqual(
+      await ctx.rpcHandlers.setAccountKey({ providerID: "openrouter", key: "secret" }),
+      { stored: true, providerID: "openrouter" },
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+    cleanup()
+  }
+})
+
 test("configuration: disabling the current model routes the next prompt to an alternative", async () => {
   const ctx = fakeContext([model("a"), model("b")], { askBeforeOverride: false })
   const cleanup = setupModelAutoRouter(ctx, {})
